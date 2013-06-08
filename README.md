@@ -29,7 +29,7 @@ gtm (go tail mongo) is a library written in Go which tails the mongodb oplog and
 		session.SetMode(mgo.Monotonic, true)
 		
 		ops, errs := gtm.Tail(session)
-		// Start returns 2 channels - one for events and one for errors
+		// Tail returns 2 channels - one for events and one for errors
 		for {
 			// loop forever receiving events	
 			select {
