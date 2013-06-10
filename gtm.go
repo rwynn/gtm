@@ -141,7 +141,7 @@ func FetchDocuments(session *mgo.Session, inOp OpChan, inErr chan error,
 			outErr <- err
 		case op:= <-inOp:
 			fetchErr := op.FetchData(s)
-			if fetchErr == nil {
+			if fetchErr == nil || fetchErr == mgo.ErrNotFound {
 				outOp <- op
 			} else {
 				outErr <- fetchErr
