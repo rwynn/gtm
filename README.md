@@ -18,6 +18,7 @@ gtm (go tail mongo) is a library written in Go which tails the mongodb oplog and
 	import "labix.org/v2/mgo"
 	import "labix.org/v2/mgo/bson"
 	import "github.com/rwynn/gtm"
+	import "fmt"
 
 	func main() {
 		// get a mgo session	
@@ -37,9 +38,9 @@ gtm (go tail mongo) is a library written in Go which tails the mongodb oplog and
 				// handle errors
 				fmt.Println(err)
 			case op:= <-ops:
-				// op will be a create, delete or update to mongo
+				// op will be an insert, delete or update to mongo
 				// you can check which by calling op.IsInsert(), op.IsDelete(), or op.IsUpdate()
-				// op.Data will get you the full document for creates and updates
+				// op.Data will get you the full document for inserts and updates
 				msg := fmt.Sprintf(`Got op <%v> for object <%v> 
 				in database <%v>
 				and collection <%v>
