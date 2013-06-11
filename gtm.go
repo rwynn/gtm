@@ -8,6 +8,11 @@ import (
 	"strings"
 )
 
+type Options struct {
+	After bson.MongoTimestamp
+	Filter OpFilter
+}
+
 type Op struct {
 	Id bson.ObjectId
 	Operation string
@@ -101,7 +106,7 @@ func GetOpLogQuery(collection *mgo.Collection, after bson.MongoTimestamp) *mgo.Q
 }
 
 func TailOps(session *mgo.Session, channel OpChan,
-	errChan chan error, timeout string, after bson.MongoTimestamp, filter OpFilter) error {
+	errChan chan error, timeout string, after bson.MongoTimestamp, accept OpFilter) error {
 	s := session.Copy()
 	defer s.Close()
 	collection := OpLogCollection(s)
@@ -117,7 +122,7 @@ func TailOps(session *mgo.Session, channel OpChan,
 			op := &Op{"", "", "", nil, bson.MongoTimestamp(0)}
 			op.ParseLogEntry(entry)
 			if op.Id != "" {
-				if filter == nil || filter(op) == false {
+				if accept == nil || accept(op) {
 					channel <- op
 				}
 			}
@@ -155,24 +160,13 @@ func FetchDocuments(session *mgo.Session, inOp OpChan, inErr chan error,
 	return nil
 }
 
-func TailAfter(session *mgo.Session, timestamp bson.MongoTimestamp, filter OpFilter) (OpChan, chan error) {
+func Tail(session *mgo.Session, options *Options) (OpChan, chan error) {
 	inErr := make(chan error, 20)
 	outErr := make(chan error, 20)
 	inOp := make(OpChan, 20)
 	outOp := make(OpChan, 20)
 	go FetchDocuments(session, inOp, inErr, outOp, outErr)
-	go TailOps(session, inOp, inErr, "5s", timestamp, filter)
+	go TailOps(session, inOp, inErr, "5s", options.After, options.Filter)
 	return outOp, outErr
 }
 
-func TailAfter(session *mgo.Session, timestamp bson.MongoTimestamp) (OpChan, chan error) {
-	return TailAfter(session, timestamp, nil)
-}
-
-func Tail(session *mgo.Session) (OpChan, chan error) {
-	return TailAfter(session, bson.MongoTimestamp(0), nil)
-}
-
-func Tail(session *mgo.Session, filter OpFilter) (OpChan, chan error) {
-	return TailAfter(session, bson.MongoTimestamp(0), filter)
-}

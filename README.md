@@ -20,6 +20,10 @@ gtm (go tail mongo) is a library written in Go which tails the mongodb oplog and
 	import "github.com/rwynn/gtm"
 	import "fmt"
 
+	func NewUsers(op *gtm.Op) bool {
+		return op.Namespace == "users.users" && op.IsInsert()
+	}
+
 	func main() {
 		// get a mgo session	
 		session, err := mgo.Dial("localhost")
@@ -29,7 +33,7 @@ gtm (go tail mongo) is a library written in Go which tails the mongodb oplog and
 		defer session.Close()
 		session.SetMode(mgo.Monotonic, true)
 		
-		ops, errs := gtm.Tail(session)
+		ops, errs := gtm.Tail(session, &gtm.Options{0, nil})
 		// Tail returns 2 channels - one for events and one for errors
 		for {
 			// loop forever receiving events	
@@ -51,8 +55,12 @@ gtm (go tail mongo) is a library written in Go which tails the mongodb oplog and
 				fmt.Println(msg) // or do something more interesting
 			}
 		}
-		// if you have the last op.Timestamp and want to start receiving
+		// if you have an op.Timestamp and want to start receiving
 		// events after that timestamp use the following
-		// ops, errs := TailAfter(session, timestamp)
+		ops, errs := gtm.Tail(session, &gtm.Options(timestamp, nil))
+
+		// if you want to listen only for certain events on certain collections
+		// pass a filter function in options
+		ops, errs := gtm.Tail(session, &gtm.Options(0, NewUsers)
 	}
 
