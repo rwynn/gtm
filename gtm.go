@@ -20,6 +20,8 @@ type OpChan chan *Op
 
 type OpLogEntry map[string]interface{}
 
+type OpFilter func (*Op) bool
+
 func (this *Op) IsInsert() bool {
 	return this.Operation == "i"
 }
@@ -61,6 +63,7 @@ func (this *Op) FetchData(session *mgo.Session) error {
 
 func (this *Op) ParseLogEntry(entry OpLogEntry) {
 	this.Operation = entry["op"].(string)
+	this.Timestamp = entry["ts"].(bson.MongoTimestamp)
 	// only parse inserts, deletes, and updates	
 	if this.IsInsert() || this.IsDelete() || this.IsUpdate() {
 		var objectField OpLogEntry
@@ -71,7 +74,6 @@ func (this *Op) ParseLogEntry(entry OpLogEntry) {
 		}
 		this.Id = objectField["_id"].(bson.ObjectId)
 		this.Namespace = entry["ns"].(string)
-		this.Timestamp = entry["ts"].(bson.MongoTimestamp)
 	}
 }
 
@@ -99,7 +101,7 @@ func GetOpLogQuery(collection *mgo.Collection, after bson.MongoTimestamp) *mgo.Q
 }
 
 func TailOps(session *mgo.Session, channel OpChan,
-	errChan chan error, timeout string, after bson.MongoTimestamp) error {
+	errChan chan error, timeout string, after bson.MongoTimestamp, filter OpFilter) error {
 	s := session.Copy()
 	defer s.Close()
 	collection := OpLogCollection(s)
@@ -115,9 +117,11 @@ func TailOps(session *mgo.Session, channel OpChan,
 			op := &Op{"", "", "", nil, bson.MongoTimestamp(0)}
 			op.ParseLogEntry(entry)
 			if op.Id != "" {
-				after = op.Timestamp
-				channel <- op
+				if filter == nil || filter(op) == false {
+					channel <- op
+				}
 			}
+			after = op.Timestamp
 		}
 		if err = iter.Close(); err != nil {
 			errChan <- err
@@ -151,16 +155,24 @@ func FetchDocuments(session *mgo.Session, inOp OpChan, inErr chan error,
 	return nil
 }
 
-func TailAfter(session *mgo.Session, timestamp bson.MongoTimestamp) (OpChan, chan error) {
-	inErr := make(chan error)
-	outErr := make(chan error)
-	inOp := make(OpChan)
-	outOp := make(OpChan)
+func TailAfter(session *mgo.Session, timestamp bson.MongoTimestamp, filter OpFilter) (OpChan, chan error) {
+	inErr := make(chan error, 20)
+	outErr := make(chan error, 20)
+	inOp := make(OpChan, 20)
+	outOp := make(OpChan, 20)
 	go FetchDocuments(session, inOp, inErr, outOp, outErr)
-	go TailOps(session, inOp, inErr, "5s", timestamp)
+	go TailOps(session, inOp, inErr, "5s", timestamp, filter)
 	return outOp, outErr
 }
 
+func TailAfter(session *mgo.Session, timestamp bson.MongoTimestamp) (OpChan, chan error) {
+	return TailAfter(session, timestamp, nil)
+}
+
 func Tail(session *mgo.Session) (OpChan, chan error) {
-	return TailAfter(session, bson.MongoTimestamp(0))
+	return TailAfter(session, bson.MongoTimestamp(0), nil)
+}
+
+func Tail(session *mgo.Session, filter OpFilter) (OpChan, chan error) {
+	return TailAfter(session, bson.MongoTimestamp(0), filter)
 }
