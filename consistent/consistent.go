@@ -9,10 +9,12 @@ import (
 	"fmt"
 )
 
-var EmptyWorkers = errors.New("Config not found or workers empty")
+var EmptyWorkers = errors.New("config not found or workers empty")
+var InvalidWorkers = errors.New("workers must be an array of string")
+var WorkerMissing = errors.New("the specified worker was not found in the config")
 
 // returns an operation filter which uses a consistent hash to determine
-// if the operation will be accepted. can be used to distribute work. 
+// if the operation will be accepted for processing. can be used to distribute work. 
 // name:		the name of the worker creating this filter. e.g. "Harry"
 // configFile:	a file path to a json document.  the document should contain
 //				an object with a property named 'workers' which is a list of
@@ -24,9 +26,20 @@ func ConsistentHashFilter(name string, configFile string) (gtm.OpFilter, error) 
 	if len(workers) == 0 {
 		return nil, EmptyWorkers
 	}
+	found := false
 	consist := consistent.New()
 	for _, worker := range workers {
-		consist.Add(worker.(string))
+		next, ok := worker.(string)
+		if !ok {
+			return nil, InvalidWorkers
+		}
+		if next == name {
+			found = true
+		}
+		consist.Add(next)
+	}
+	if !found {
+		return nil, WorkerMissing
 	}
 	return func(op *gtm.Op) bool {
 		var idStr string
