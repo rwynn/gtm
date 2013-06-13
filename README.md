@@ -1,6 +1,7 @@
 gtm
 ===
-gtm (go tail mongo) is a library written in Go which tails the mongodb oplog and sends create, update, delete events to your code
+gtm (go tail mongo) is a utility written in Go which tails the MongoDB oplog and sends create, update, delete events to your code.
+It can be used to send emails to new users, index documents in Solr, or something else.
 
 ### Requirements ###
 + [Go](http://golang.org/doc/install)
@@ -64,3 +65,31 @@ gtm (go tail mongo) is a library written in Go which tails the mongodb oplog and
 		ops, errs := gtm.Tail(session, &gtm.Options(0, NewUsers)
 	}
 
+
+### Advanced ###
+
+You may want to distribute event handling between a set of worker processes on different machines.
+To do this you can leverage the "github.com/rwynn/gtm/consistent" package.  
+
+1. Create a json document containing a list of all the event handlers.
+
+	{ 
+		workers: ["Tom", "Dick", "Harry"] 
+	}
+
+2. Create a consistent filter to distribute the work between Tom, Dick, and Harry.
+	
+	name := flag.String("name", "", "the name of this worker")
+	flag.Parse()
+	filter, filterErr := consistent.ConsistentHashFilter(*name, "/path/to/json")
+	if filterErr != nil {
+		panic(filterErr)
+	}
+
+3. Pass the filter into the options when calling gtm.Tail
+
+	ops, errs := gtm.Tail(session, &gtm.Options{0, filter})
+
+4. (Optional) If you have your own filter you can use the gtm utility method ChainOpFilters
+	
+	func ChainOpFilters(filters ...OpFilter) OpFilter

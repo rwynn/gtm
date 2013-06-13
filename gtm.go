@@ -14,7 +14,7 @@ type Options struct {
 }
 
 type Op struct {
-	Id bson.ObjectId
+	Id interface{}
 	Operation string
 	Namespace string
 	Data map[string]interface{}
@@ -26,6 +26,17 @@ type OpChan chan *Op
 type OpLogEntry map[string]interface{}
 
 type OpFilter func (*Op) bool
+
+func ChainOpFilters(filters ...OpFilter) OpFilter {
+	return func(op *Op) bool {
+		for _, filter := range filters {
+			if filter(op) == false {
+				return false
+			}
+		}
+		return true
+	}
+}
 
 func (this *Op) IsInsert() bool {
 	return this.Operation == "i"
@@ -77,7 +88,7 @@ func (this *Op) ParseLogEntry(entry OpLogEntry) {
 		} else {
 			objectField = entry["o"].(OpLogEntry)
 		}
-		this.Id = objectField["_id"].(bson.ObjectId)
+		this.Id = objectField["_id"]
 		this.Namespace = entry["ns"].(string)
 	}
 }
@@ -166,7 +177,7 @@ func Tail(session *mgo.Session, options *Options) (OpChan, chan error) {
 	inOp := make(OpChan, 20)
 	outOp := make(OpChan, 20)
 	go FetchDocuments(session, inOp, inErr, outOp, outErr)
-	go TailOps(session, inOp, inErr, "5s", options.After, options.Filter)
+	go TailOps(session, inOp, inErr, "10s", options.After, options.Filter)
 	return outOp, outErr
 }
 
