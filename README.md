@@ -71,13 +71,13 @@ It can be used to send emails to new users, index documents in Solr, or somethin
 You may want to distribute event handling between a set of worker processes on different machines.
 To do this you can leverage the **github.com/rwynn/gtm/consistent** package.  
 
-1. Create a json document containing a list of all the event handlers.
+Create a json document containing a list of all the event handlers.
 
 	{ 
 		workers: ["Tom", "Dick", "Harry"] 
 	}
 
-2. Create a consistent filter to distribute the work between Tom, Dick, and Harry.
+Create a consistent filter to distribute the work between Tom, Dick, and Harry.
 	
 	name := flag.String("name", "", "the name of this worker")
 	flag.Parse()
@@ -90,10 +90,10 @@ To do this you can leverage the **github.com/rwynn/gtm/consistent** package.
 	// you to pass a Mongo document representing the config if you would like to avoid
 	// copying the same config file to multiple servers
 
-3. Pass the filter into the options when calling gtm.Tail
+Pass the filter into the options when calling gtm.Tail
 
 	ops, errs := gtm.Tail(session, &gtm.Options{0, filter})
 
-4. (Optional) If you have your own filter you can use the gtm utility method ChainOpFilters
+(Optional) If you have your own filter you can use the gtm utility method ChainOpFilters
 	
 	func ChainOpFilters(filters ...OpFilter) OpFilter
