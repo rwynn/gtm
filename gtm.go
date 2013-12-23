@@ -4,12 +4,11 @@ import (
 	"labix.org/v2/mgo"
 	"labix.org/v2/mgo/bson"
 	"time"
-	"fmt"
 	"strings"
 )
 
 type Options struct {
-	After bson.MongoTimestamp
+	After TimestampGenerator
 	Filter OpFilter
 }
 
@@ -21,11 +20,23 @@ type Op struct {
 	Timestamp bson.MongoTimestamp
 }
 
+type OpLog struct {
+	Timestamp bson.MongoTimestamp "ts"
+	HistoryID int64 "h"
+	MongoVersion int "v"
+	Operation string "op"
+	Namespace string "ns"
+	Object bson.M "o"
+	QueryObject bson.M "o2"
+}
+
 type OpChan chan *Op
 
 type OpLogEntry map[string]interface{}
 
 type OpFilter func (*Op) bool
+
+type TimestampGenerator func(*mgo.Session) bson.MongoTimestamp
 
 func ChainOpFilters(filters ...OpFilter) OpFilter {
 	return func(op *Op) bool {
@@ -104,40 +115,44 @@ func ParseTimestamp(timestamp bson.MongoTimestamp) (int32, int32) {
 	return int32(ts), int32(ordinal)
 }
 
-func AfterTimestampFunc(ts int32, ordinal int32) string {
-	return fmt.Sprintf(`function() { 
-		return this.ts.t > %v 
-		|| (this.ts.t == %v && this.ts.i > %v)
-		}`, ts, ts, ordinal)
+func AfterLastOp(session *mgo.Session) bson.MongoTimestamp {
+	var opLog OpLog
+	collection := OpLogCollection(session)
+	collection.Find(nil).Sort("-$natural").One(&opLog)
+	return opLog.Timestamp
 }
 
-func GetOpLogQuery(collection *mgo.Collection, after bson.MongoTimestamp) *mgo.Query {
-	tsFun := AfterTimestampFunc(ParseTimestamp(after))
-	return collection.Find(bson.M{"$where": tsFun}).Sort("$natural")
+func GetOpLogQuery(session *mgo.Session, after TimestampGenerator)  *mgo.Query {
+	query := bson.M{"ts": bson.M{"$gt": after(session)}}
+	collection := OpLogCollection(session)
+	return collection.Find(query).LogReplay().Sort("$natural")
 }
 
 func TailOps(session *mgo.Session, channel OpChan,
-	errChan chan error, timeout string, after bson.MongoTimestamp, accept OpFilter) error {
+	errChan chan error, timeout string, options *Options) error {
 	s := session.Copy()
 	defer s.Close()
-	collection := OpLogCollection(s)
 	duration, err := time.ParseDuration(timeout)
 	if err != nil {
 		errChan <- err
 		return err
 	}
-	iter := GetOpLogQuery(collection, after).Tail(duration)
+	if options.After == nil {
+		options.After = AfterLastOp
+	}
+	iter := GetOpLogQuery(s, options.After).Tail(duration)
+	var last bson.MongoTimestamp;
 	for {
 		entry := make(OpLogEntry)
 		for iter.Next(entry) {
 			op := &Op{"", "", "", nil, bson.MongoTimestamp(0)}
 			op.ParseLogEntry(entry)
 			if op.Id != "" {
-				if accept == nil || accept(op) {
+				if options.Filter == nil || options.Filter(op) {
 					channel <- op
 				}
 			}
-			after = op.Timestamp
+			last = op.Timestamp
 		}
 		if err = iter.Close(); err != nil {
 			errChan <- err
@@ -146,7 +161,8 @@ func TailOps(session *mgo.Session, channel OpChan,
 		if iter.Timeout() {
 			continue
 		}
-		iter = GetOpLogQuery(collection, after).Tail(duration)
+		iter = GetOpLogQuery(s,
+			func(*mgo.Session) bson.MongoTimestamp { return last } ).Tail(duration)
 	}
 	return nil
 }
@@ -177,7 +193,7 @@ func Tail(session *mgo.Session, options *Options) (OpChan, chan error) {
 	inOp := make(OpChan, 20)
 	outOp := make(OpChan, 20)
 	go FetchDocuments(session, inOp, inErr, outOp, outErr)
-	go TailOps(session, inOp, inErr, "10s", options.After, options.Filter)
+	go TailOps(session, inOp, inErr, "100s", options)
 	return outOp, outErr
 }
 

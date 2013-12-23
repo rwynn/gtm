@@ -34,7 +34,7 @@ It can be used to send emails to new users, index documents in Solr, or somethin
 		defer session.Close()
 		session.SetMode(mgo.Monotonic, true)
 		
-		ops, errs := gtm.Tail(session, &gtm.Options{0, nil})
+		ops, errs := gtm.Tail(session, &gtm.Options{nil, nil})
 		// Tail returns 2 channels - one for events and one for errors
 		for {
 			// loop forever receiving events	
@@ -56,13 +56,10 @@ It can be used to send emails to new users, index documents in Solr, or somethin
 				fmt.Println(msg) // or do something more interesting
 			}
 		}
-		// if you have an op.Timestamp and want to start receiving
-		// events after that timestamp use the following
-		ops, errs := gtm.Tail(session, &gtm.Options(timestamp, nil))
-
+		
 		// if you want to listen only for certain events on certain collections
 		// pass a filter function in options
-		ops, errs := gtm.Tail(session, &gtm.Options(0, NewUsers)
+		ops, errs := gtm.Tail(session, &gtm.Options(nil, NewUsers)
 	}
 
 
@@ -92,7 +89,7 @@ Create a consistent filter to distribute the work between Tom, Dick, and Harry.
 
 Pass the filter into the options when calling gtm.Tail
 
-	ops, errs := gtm.Tail(session, &gtm.Options{0, filter})
+	ops, errs := gtm.Tail(session, &gtm.Options{nil, filter})
 
 (Optional) If you have your own filter you can use the gtm utility method ChainOpFilters
 	
