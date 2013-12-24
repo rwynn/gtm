@@ -115,7 +115,7 @@ func ParseTimestamp(timestamp bson.MongoTimestamp) (int32, int32) {
 	return int32(ts), int32(ordinal)
 }
 
-func AfterLastOp(session *mgo.Session) bson.MongoTimestamp {
+func LastOpTimestamp(session *mgo.Session) bson.MongoTimestamp {
 	var opLog OpLog
 	collection := OpLogCollection(session)
 	collection.Find(nil).Sort("-$natural").One(&opLog)
@@ -138,10 +138,10 @@ func TailOps(session *mgo.Session, channel OpChan,
 		return err
 	}
 	if options.After == nil {
-		options.After = AfterLastOp
+		options.After = LastOpTimestamp
 	}
-	iter := GetOpLogQuery(s, options.After).Tail(duration)
 	var last bson.MongoTimestamp;
+	iter := GetOpLogQuery(s, options.After).Tail(duration)
 	for {
 		entry := make(OpLogEntry)
 		for iter.Next(entry) {
