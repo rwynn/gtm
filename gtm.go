@@ -140,7 +140,7 @@ func TailOps(session *mgo.Session, channel OpChan,
 	if options.After == nil {
 		options.After = LastOpTimestamp
 	}
-	var last bson.MongoTimestamp;
+	currTimestamp := options.After(s)
 	iter := GetOpLogQuery(s, options.After).Tail(duration)
 	for {
 		entry := make(OpLogEntry)
@@ -152,7 +152,7 @@ func TailOps(session *mgo.Session, channel OpChan,
 					channel <- op
 				}
 			}
-			last = op.Timestamp
+			currTimestamp = op.Timestamp
 		}
 		if err = iter.Close(); err != nil {
 			errChan <- err
@@ -162,7 +162,7 @@ func TailOps(session *mgo.Session, channel OpChan,
 			continue
 		}
 		iter = GetOpLogQuery(s,
-			func(*mgo.Session) bson.MongoTimestamp { return last } ).Tail(duration)
+			func(*mgo.Session) bson.MongoTimestamp { return currTimestamp } ).Tail(duration)
 	}
 	return nil
 }
