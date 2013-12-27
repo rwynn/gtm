@@ -122,8 +122,8 @@ func LastOpTimestamp(session *mgo.Session) bson.MongoTimestamp {
 	return opLog.Timestamp
 }
 
-func GetOpLogQuery(session *mgo.Session, after TimestampGenerator)  *mgo.Query {
-	query := bson.M{"ts": bson.M{"$gt": after(session)}}
+func GetOpLogQuery(session *mgo.Session, after bson.MongoTimestamp)  *mgo.Query {
+	query := bson.M{"ts": bson.M{"$gt": after}}
 	collection := OpLogCollection(session)
 	return collection.Find(query).LogReplay().Sort("$natural")
 }
@@ -141,7 +141,7 @@ func TailOps(session *mgo.Session, channel OpChan,
 		options.After = LastOpTimestamp
 	}
 	currTimestamp := options.After(s)
-	iter := GetOpLogQuery(s, options.After).Tail(duration)
+	iter := GetOpLogQuery(s, currTimestamp).Tail(duration)
 	for {
 		entry := make(OpLogEntry)
 		for iter.Next(entry) {
@@ -161,8 +161,7 @@ func TailOps(session *mgo.Session, channel OpChan,
 		if iter.Timeout() {
 			continue
 		}
-		iter = GetOpLogQuery(s,
-			func(*mgo.Session) bson.MongoTimestamp { return currTimestamp } ).Tail(duration)
+		iter = GetOpLogQuery(s, currTimestamp).Tail(duration)
 	}
 	return nil
 }
