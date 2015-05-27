@@ -4,7 +4,7 @@ import (
 	"github.com/rwynn/gtm"
 	"github.com/stathat/consistent"
 	"github.com/stathat/jconfig"
-	"labix.org/v2/mgo/bson"
+	"gopkg.in/mgo.v2/bson"
 	"errors"
 	"fmt"
 )

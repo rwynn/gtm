@@ -16,8 +16,8 @@ It can be used to send emails to new users, index documents in Solr, or somethin
 	
 	package main
 	
-	import "labix.org/v2/mgo"
-	import "labix.org/v2/mgo/bson"
+	import "gopkg.in/mgo.v2"
+	import "gopkg.in/mgo.v2/bson"
 	import "github.com/rwynn/gtm"
 	import "fmt"
 

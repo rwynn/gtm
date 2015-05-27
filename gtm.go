@@ -1,8 +1,8 @@
 package gtm
 
 import (
-	"labix.org/v2/mgo"
-	"labix.org/v2/mgo/bson"
+	"gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2/bson"
 	"time"
 	"strings"
 )
@@ -105,8 +105,24 @@ func (this *Op) ParseLogEntry(entry OpLogEntry) {
 }
 
 func OpLogCollection(session *mgo.Session) *mgo.Collection {
-	collection := session.DB("local").C("oplog.rs")
-	return collection
+	localDB := session.DB("local")
+	col_names, err := localDB.CollectionNames()
+	if err == nil {
+		var col_name *string = nil
+		for _, name := range col_names {
+			if strings.HasPrefix(name, "oplog.") {
+				col_name = &name
+				break
+			}
+		}
+		if col_name == nil {
+			panic("Unable to find oplog collection in db local")
+		} else {
+			return localDB.C(*col_name)
+		}
+	} else {
+		panic("Unable to get collection names for db local");
+	}
 }
 
 func ParseTimestamp(timestamp bson.MongoTimestamp) (int32, int32) {
