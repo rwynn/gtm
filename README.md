@@ -6,7 +6,9 @@ It can be used to send emails to new users, index documents in Solr, or somethin
 ### Requirements ###
 + [Go](http://golang.org/doc/install)
 + [mgo](http://labix.org/mgo), the mongodb driver for Go
-+ [mongodb](http://www.mongodb.org/) (setup for [replica sets](http://docs.mongodb.org/manual/tutorial/deploy-replica-set/) because otherwise there is no oplog to read from)
++ [mongodb](http://www.mongodb.org/)
+	+ Pass argument --master to mongod to ensure an oplog is created OR
+	+ Setup [replica sets](http://docs.mongodb.org/manual/tutorial/deploy-replica-set/) to create oplog
 
 ### Installation ###
 
