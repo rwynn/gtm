@@ -3,38 +3,38 @@ package gtm
 import (
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
-	"time"
 	"strings"
+	"time"
 )
 
 type Options struct {
-	After TimestampGenerator
+	After  TimestampGenerator
 	Filter OpFilter
 }
 
 type Op struct {
-	Id interface{}
+	Id        interface{}
 	Operation string
 	Namespace string
-	Data map[string]interface{}
+	Data      map[string]interface{}
 	Timestamp bson.MongoTimestamp
 }
 
 type OpLog struct {
-	Timestamp bson.MongoTimestamp "ts"
-	HistoryID int64 "h"
-	MongoVersion int "v"
-	Operation string "op"
-	Namespace string "ns"
-	Object bson.M "o"
-	QueryObject bson.M "o2"
+	Timestamp    bson.MongoTimestamp "ts"
+	HistoryID    int64               "h"
+	MongoVersion int                 "v"
+	Operation    string              "op"
+	Namespace    string              "ns"
+	Object       bson.M              "o"
+	QueryObject  bson.M              "o2"
 }
 
 type OpChan chan *Op
 
 type OpLogEntry map[string]interface{}
 
-type OpFilter func (*Op) bool
+type OpFilter func(*Op) bool
 
 type TimestampGenerator func(*mgo.Session) bson.MongoTimestamp
 
@@ -91,7 +91,7 @@ func (this *Op) FetchData(session *mgo.Session) error {
 func (this *Op) ParseLogEntry(entry OpLogEntry) {
 	this.Operation = entry["op"].(string)
 	this.Timestamp = entry["ts"].(bson.MongoTimestamp)
-	// only parse inserts, deletes, and updates	
+	// only parse inserts, deletes, and updates
 	if this.IsInsert() || this.IsDelete() || this.IsUpdate() {
 		var objectField OpLogEntry
 		if this.IsUpdate() {
@@ -121,7 +121,7 @@ func OpLogCollection(session *mgo.Session) *mgo.Collection {
 			return localDB.C(*col_name)
 		}
 	} else {
-		panic("Unable to get collection names for db local");
+		panic("Unable to get collection names for db local")
 	}
 }
 
@@ -138,7 +138,7 @@ func LastOpTimestamp(session *mgo.Session) bson.MongoTimestamp {
 	return opLog.Timestamp
 }
 
-func GetOpLogQuery(session *mgo.Session, after bson.MongoTimestamp)  *mgo.Query {
+func GetOpLogQuery(session *mgo.Session, after bson.MongoTimestamp) *mgo.Query {
 	query := bson.M{"ts": bson.M{"$gt": after}}
 	collection := OpLogCollection(session)
 	return collection.Find(query).LogReplay().Sort("$natural")
@@ -188,9 +188,9 @@ func FetchDocuments(session *mgo.Session, inOp OpChan, inErr chan error,
 	defer s.Close()
 	for {
 		select {
-		case err:= <-inErr:
+		case err := <-inErr:
 			outErr <- err
-		case op:= <-inOp:
+		case op := <-inOp:
 			fetchErr := op.FetchData(s)
 			if fetchErr == nil || fetchErr == mgo.ErrNotFound {
 				outOp <- op
@@ -211,4 +211,3 @@ func Tail(session *mgo.Session, options *Options) (OpChan, chan error) {
 	go TailOps(session, inOp, inErr, "100s", options)
 	return outOp, outErr
 }
-
