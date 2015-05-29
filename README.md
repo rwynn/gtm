@@ -35,8 +35,8 @@ It can be used to send emails to new users, index documents in Solr, or somethin
 		}
 		defer session.Close()
 		session.SetMode(mgo.Monotonic, true)
-		
-		ops, errs := gtm.Tail(session, &gtm.Options{nil, nil})
+		// nil options get initialized to gtm.DefaultOptions()
+		ops, errs := gtm.Tail(session, nil)
 		// Tail returns 2 channels - one for events and one for errors
 		for {
 			// loop forever receiving events	
@@ -58,10 +58,16 @@ It can be used to send emails to new users, index documents in Solr, or somethin
 				fmt.Println(msg) // or do something more interesting
 			}
 		}
-		
 		// if you want to listen only for certain events on certain collections
 		// pass a filter function in options
-		ops, errs := gtm.Tail(session, &gtm.Options(nil, NewUsers)
+		ops, errs := gtm.Tail(session, &gtm.Options{
+			After:               nil,     	// if nil defaults to LastOpTimestamp
+			Filter:              NewUsers, 	// only receive inserts in the user collection
+			OpLogDatabaseName:   nil,     	// if nil defaults to "local"
+			OpLogCollectionName: nil,     	// if nil a defaults to a collection prefixed "oplog."
+			CursorTimeout:       nil,     	// if nil defaults to 100s
+			ChannelSize:         0,       	// if less than 1 defaults to 20
+		})
 	}
 
 

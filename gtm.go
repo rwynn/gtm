@@ -1,6 +1,7 @@
 package gtm
 
 import (
+	"fmt"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 	"strings"
@@ -8,8 +9,12 @@ import (
 )
 
 type Options struct {
-	After  TimestampGenerator
-	Filter OpFilter
+	After               TimestampGenerator
+	Filter              OpFilter
+	OpLogDatabaseName   *string
+	OpLogCollectionName *string
+	CursorTimeout       *string
+	ChannelSize         int
 }
 
 type Op struct {
@@ -36,7 +41,7 @@ type OpLogEntry map[string]interface{}
 
 type OpFilter func(*Op) bool
 
-type TimestampGenerator func(*mgo.Session) bson.MongoTimestamp
+type TimestampGenerator func(*mgo.Session, *Options) bson.MongoTimestamp
 
 func ChainOpFilters(filters ...OpFilter) OpFilter {
 	return func(op *Op) bool {
@@ -104,8 +109,8 @@ func (this *Op) ParseLogEntry(entry OpLogEntry) {
 	}
 }
 
-func OpLogCollection(session *mgo.Session) *mgo.Collection {
-	localDB := session.DB("local")
+func OpLogCollectionName(session *mgo.Session, options *Options) string {
+	localDB := session.DB(*options.OpLogDatabaseName)
 	col_names, err := localDB.CollectionNames()
 	if err == nil {
 		var col_name *string = nil
@@ -116,13 +121,23 @@ func OpLogCollection(session *mgo.Session) *mgo.Collection {
 			}
 		}
 		if col_name == nil {
-			panic("Unable to find oplog collection in db local")
+			msg := fmt.Sprintf(`
+				Unable to find oplog collection 
+				in database %v`, *options.OpLogDatabaseName)
+			panic(msg)
 		} else {
-			return localDB.C(*col_name)
+			return *col_name
 		}
 	} else {
-		panic("Unable to get collection names for db local")
+		msg := fmt.Sprintf(`Unable to get collection names 
+				for database %v`, *options.OpLogDatabaseName)
+		panic(msg)
 	}
+}
+
+func OpLogCollection(session *mgo.Session, options *Options) *mgo.Collection {
+	localDB := session.DB(*options.OpLogDatabaseName)
+	return localDB.C(*options.OpLogCollectionName)
 }
 
 func ParseTimestamp(timestamp bson.MongoTimestamp) (int32, int32) {
@@ -131,33 +146,47 @@ func ParseTimestamp(timestamp bson.MongoTimestamp) (int32, int32) {
 	return int32(ts), int32(ordinal)
 }
 
-func LastOpTimestamp(session *mgo.Session) bson.MongoTimestamp {
+func LastOpTimestamp(session *mgo.Session, options *Options) bson.MongoTimestamp {
 	var opLog OpLog
-	collection := OpLogCollection(session)
+	collection := OpLogCollection(session, options)
 	collection.Find(nil).Sort("-$natural").One(&opLog)
 	return opLog.Timestamp
 }
 
-func GetOpLogQuery(session *mgo.Session, after bson.MongoTimestamp) *mgo.Query {
+func GetOpLogQuery(session *mgo.Session, after bson.MongoTimestamp, options *Options) *mgo.Query {
 	query := bson.M{"ts": bson.M{"$gt": after}}
-	collection := OpLogCollection(session)
+	collection := OpLogCollection(session, options)
 	return collection.Find(query).LogReplay().Sort("$natural")
 }
 
-func TailOps(session *mgo.Session, channel OpChan,
-	errChan chan error, timeout string, options *Options) error {
-	s := session.Copy()
-	defer s.Close()
-	duration, err := time.ParseDuration(timeout)
-	if err != nil {
-		errChan <- err
-		return err
-	}
+func FillEmptyOptions(session *mgo.Session, options *Options) {
 	if options.After == nil {
 		options.After = LastOpTimestamp
 	}
-	currTimestamp := options.After(s)
-	iter := GetOpLogQuery(s, currTimestamp).Tail(duration)
+	if options.OpLogDatabaseName == nil {
+		defaultOpLogDatabaseName := "local"
+		options.OpLogDatabaseName = &defaultOpLogDatabaseName
+	}
+	if options.OpLogCollectionName == nil {
+		defaultOpLogCollectionName := OpLogCollectionName(session, options)
+		options.OpLogCollectionName = &defaultOpLogCollectionName
+	}
+	if options.CursorTimeout == nil {
+		defaultCursorTimeout := "100s"
+		options.CursorTimeout = &defaultCursorTimeout
+	}
+}
+
+func TailOps(session *mgo.Session, channel OpChan, errChan chan error, options *Options) error {
+	s := session.Copy()
+	defer s.Close()
+	FillEmptyOptions(session, options)
+	duration, err := time.ParseDuration(*options.CursorTimeout)
+	if err != nil {
+		panic("Invalid value for CursorTimeout")
+	}
+	currTimestamp := options.After(s, options)
+	iter := GetOpLogQuery(s, currTimestamp, options).Tail(duration)
 	for {
 		entry := make(OpLogEntry)
 		for iter.Next(entry) {
@@ -177,7 +206,7 @@ func TailOps(session *mgo.Session, channel OpChan,
 		if iter.Timeout() {
 			continue
 		}
-		iter = GetOpLogQuery(s, currTimestamp).Tail(duration)
+		iter = GetOpLogQuery(s, currTimestamp, options).Tail(duration)
 	}
 	return nil
 }
@@ -202,12 +231,28 @@ func FetchDocuments(session *mgo.Session, inOp OpChan, inErr chan error,
 	return nil
 }
 
+func DefaultOptions() *Options {
+	return &Options{
+		After:               nil,
+		Filter:              nil,
+		OpLogDatabaseName:   nil,
+		OpLogCollectionName: nil,
+		CursorTimeout:       nil,
+		ChannelSize:         20,
+	}
+}
+
 func Tail(session *mgo.Session, options *Options) (OpChan, chan error) {
-	inErr := make(chan error, 20)
-	outErr := make(chan error, 20)
-	inOp := make(OpChan, 20)
-	outOp := make(OpChan, 20)
+	if options == nil {
+		options = DefaultOptions()
+	} else if options.ChannelSize < 1 {
+		options.ChannelSize = 20
+	}
+	inErr := make(chan error, options.ChannelSize)
+	outErr := make(chan error, options.ChannelSize)
+	inOp := make(OpChan, options.ChannelSize)
+	outOp := make(OpChan, options.ChannelSize)
 	go FetchDocuments(session, inOp, inErr, outOp, outErr)
-	go TailOps(session, inOp, inErr, "100s", options)
+	go TailOps(session, inOp, inErr, options)
 	return outOp, outErr
 }
