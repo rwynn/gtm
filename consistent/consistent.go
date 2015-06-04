@@ -65,7 +65,7 @@ func ConsistentHashFilter(name string, workers []interface{}) (gtm.OpFilter, err
 		case bson.ObjectId:
 			idStr = op.Id.(bson.ObjectId).Hex()
 		default:
-			idStr = fmt.Sprintf("%v", op)
+			idStr = fmt.Sprintf("%v", op.Id)
 		}
 		who, err := consist.Get(idStr)
 		if err != nil {

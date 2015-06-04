@@ -18,11 +18,11 @@ type Options struct {
 }
 
 type Op struct {
-	Id        interface{}
-	Operation string
-	Namespace string
-	Data      map[string]interface{}
-	Timestamp bson.MongoTimestamp
+	Id        interface{}            `json:"_id"`
+	Operation string                 `json:"operation"`
+	Namespace string                 `json:"namespace"`
+	Data      map[string]interface{} `json:"data"`
+	Timestamp bson.MongoTimestamp    `json:"timestamp"`
 }
 
 type OpLog struct {
