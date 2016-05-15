@@ -4,8 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"github.com/rwynn/gtm"
-	"github.com/stathat/consistent"
-	"github.com/stathat/jconfig"
+	"stathat.com/c/consistent"
+	"stathat.com/c/jconfig"
 	"gopkg.in/mgo.v2/bson"
 )
 
