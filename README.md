@@ -84,7 +84,7 @@ Create a consistent filter to distribute the work between Tom, Dick, and Harry.
 	
 	name := flag.String("name", "", "the name of this worker")
 	flag.Parse()
-	filter, filterErr := consistent.ConsistentHashFilterFromFile(*name, "/path/to/json")
+	filter, filterErr := consistent.ConsistentHashFilterFromFile(*name, "/path/to/toml")
 	if filterErr != nil {
 		panic(filterErr)
 	}
