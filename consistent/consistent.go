@@ -3,11 +3,15 @@ package consistent
 import (
 	"errors"
 	"fmt"
+	"github.com/BurntSushi/toml"
 	"github.com/rwynn/gtm"
-	"stathat.com/c/consistent"
-	"stathat.com/c/jconfig"
+	"github.com/serialx/hashring"
 	"gopkg.in/mgo.v2/bson"
 )
+
+type ConfigOptions struct {
+	Workers []string
+}
 
 var EmptyWorkers = errors.New("config not found or workers empty")
 var InvalidWorkers = errors.New("workers must be an array of string")
@@ -15,37 +19,39 @@ var WorkerMissing = errors.New("the specified worker was not found in the config
 
 // returns an operation filter which uses a consistent hash to determine
 // if the operation will be accepted for processing. can be used to distribute work.
-// name:		the name of the worker creating this filter. e.g. "Harry"
-// configFile:	a file path to a json document.  the document should contain
-//				an object with a property named 'workers' which is a list of
-//				all the workers participating.  e.g.
-//				{ "workers": ["Tom", "Dick", "Harry"] }
+// name:	the name of the worker creating this filter. e.g. "Harry"
+// configFile:	a file path to a TOML document.  the document should contain
+// a property named 'Workers' which is a list of all the workers participating. e.g.
+// workers = [ "Tom", "Dick", "Harry" ]
 func ConsistentHashFilterFromFile(name string, configFile string) (gtm.OpFilter, error) {
-	config := jconfig.LoadConfig(configFile)
-	workers := config.GetArray("workers")
-	return ConsistentHashFilter(name, workers)
+	var config ConfigOptions
+	if _, err := toml.DecodeFile(configFile, &config); err != nil {
+		return nil, EmptyWorkers
+	} else {
+		return ConsistentHashFilter(name, config.Workers), nil
+	}
 }
 
 // returns an operation filter which uses a consistent hash to determine
 // if the operation will be accepted for processing. can be used to distribute work.
-// name:		the name of the worker creating this filter. e.g. "Harry"
+// name:	the name of the worker creating this filter. e.g. "Harry"
 // document:	a map with a string key 'workers' which has a corresponding
 //				slice of string representing the available workers
 func ConsistentHashFilterFromDocument(name string, document map[string]interface{}) (gtm.OpFilter, error) {
 	workers := document["workers"]
-	return ConsistentHashFilter(name, workers.([]interface{}))
+	return ConsistentHashFilter(name, workers.([]interface{})), nil
 }
 
 // returns an operation filter which uses a consistent hash to determine
 // if the operation will be accepted for processing. can be used to distribute work.
-// name:		the name of the worker creating this filter. e.g. "Harry"
-// workers:		a slice of strings representing the available worker names
+// name:	the name of the worker creating this filter. e.g. "Harry"
+// workers:	a slice of strings representing the available worker names
 func ConsistentHashFilter(name string, workers []interface{}) (gtm.OpFilter, error) {
 	if len(workers) == 0 {
 		return nil, EmptyWorkers
 	}
 	found := false
-	consist := consistent.New()
+	ring := hashring.New()
 	for _, worker := range workers {
 		next, ok := worker.(string)
 		if !ok {
@@ -54,7 +60,7 @@ func ConsistentHashFilter(name string, workers []interface{}) (gtm.OpFilter, err
 		if next == name {
 			found = true
 		}
-		consist.Add(next)
+		ring = ring.AddNode(next)
 	}
 	if !found {
 		return nil, WorkerMissing
@@ -67,11 +73,11 @@ func ConsistentHashFilter(name string, workers []interface{}) (gtm.OpFilter, err
 		default:
 			idStr = fmt.Sprintf("%v", op.Id)
 		}
-		who, err := consist.Get(idStr)
-		if err != nil {
-			return false
-		} else {
+		who, ok := ring.GetNode(idStr)
+		if ok {
 			return name == who
+		} else {
+			return false
 		}
 	}, nil
 }

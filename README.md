@@ -76,11 +76,9 @@ It can be used to send emails to new users, index documents in Solr, or somethin
 You may want to distribute event handling between a set of worker processes on different machines.
 To do this you can leverage the **github.com/rwynn/gtm/consistent** package.  
 
-Create a json document containing a list of all the event handlers.
+Create a TOML document containing a list of all the event handlers.
 
-	{ 
-		workers: ["Tom", "Dick", "Harry"] 
-	}
+	Workers = [ "Tom", "Dick", "Harry" ] 
 
 Create a consistent filter to distribute the work between Tom, Dick, and Harry.
 	
