@@ -54,6 +54,42 @@ func ChainOpFilters(filters ...OpFilter) OpFilter {
 	}
 }
 
+func (this *Op) IsCommand() bool {
+	return this.Operation == "c"
+}
+
+func (this *Op) IsDrop() bool {
+	if _, drop := this.IsDropDatabase(); drop {
+		return true
+	}
+	if _, drop := this.IsDropCollection(); drop {
+		return true
+	}
+	return false
+}
+
+func (this *Op) IsDropCollection() (string, bool) {
+	if this.IsCommand() {
+		if this.Data != nil {
+			if val, ok := this.Data["drop"]; ok {
+				return val.(string), true
+			}
+		}
+	}
+	return "", false
+}
+
+func (this *Op) IsDropDatabase() (string, bool) {
+	if this.IsCommand() {
+		if this.Data != nil {
+			if _, ok := this.Data["dropDatabase"]; ok {
+				return this.GetDatabase(), true
+			}
+		}
+	}
+	return "", false
+}
+
 func (this *Op) IsInsert() bool {
 	return this.Operation == "i"
 }
@@ -79,7 +115,7 @@ func (this *Op) GetCollection() string {
 }
 
 func (this *Op) FetchData(session *mgo.Session) error {
-	if this.IsDelete() {
+	if this.IsDelete() || this.IsCommand() {
 		return nil
 	}
 	collection := session.DB(this.GetDatabase()).C(this.GetCollection())
@@ -96,7 +132,7 @@ func (this *Op) FetchData(session *mgo.Session) error {
 func (this *Op) ParseLogEntry(entry OpLogEntry) {
 	this.Operation = entry["op"].(string)
 	this.Timestamp = entry["ts"].(bson.MongoTimestamp)
-	// only parse inserts, deletes, and updates
+	// only parse drops, inserts, deletes, and updates
 	if this.IsInsert() || this.IsDelete() || this.IsUpdate() {
 		var objectField OpLogEntry
 		if this.IsUpdate() {
@@ -106,6 +142,11 @@ func (this *Op) ParseLogEntry(entry OpLogEntry) {
 		}
 		this.Id = objectField["_id"]
 		this.Namespace = entry["ns"].(string)
+	} else if this.IsCommand() {
+		this.Data = entry["o"].(OpLogEntry)
+		if this.IsDrop() {
+			this.Namespace = entry["ns"].(string)
+		}
 	}
 }
 
@@ -192,7 +233,7 @@ func TailOps(session *mgo.Session, channel OpChan, errChan chan error, options *
 		for iter.Next(entry) {
 			op := &Op{"", "", "", nil, bson.MongoTimestamp(0)}
 			op.ParseLogEntry(entry)
-			if op.Id != "" {
+			if op.Namespace != "" {
 				if options.Filter == nil || options.Filter(op) {
 					channel <- op
 				}
