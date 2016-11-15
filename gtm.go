@@ -150,7 +150,7 @@ func (this *Op) ParseLogEntry(entry OpLogEntry) (include bool) {
 		include = true
 	} else if this.IsCommand() {
 		this.Data = entry["o"].(OpLogEntry)
-		include = true
+		include = this.IsDrop()
 	} else {
 		include = false
 	}
