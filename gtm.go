@@ -54,10 +54,6 @@ func ChainOpFilters(filters ...OpFilter) OpFilter {
 	}
 }
 
-func (this *Op) IsCommand() bool {
-	return this.Operation == "c"
-}
-
 func (this *Op) IsDrop() bool {
 	if _, drop := this.IsDropDatabase(); drop {
 		return true
@@ -90,6 +86,10 @@ func (this *Op) IsDropDatabase() (string, bool) {
 	return "", false
 }
 
+func (this *Op) IsCommand() bool {
+	return this.Operation == "c"
+}
+
 func (this *Op) IsInsert() bool {
 	return this.Operation == "i"
 }
@@ -111,7 +111,13 @@ func (this *Op) GetDatabase() string {
 }
 
 func (this *Op) GetCollection() string {
-	return this.ParseNamespace()[1]
+	if _, drop := this.IsDropDatabase(); drop {
+		return ""
+	} else if col, drop := this.IsDropCollection(); drop {
+		return col
+	} else {
+		return this.ParseNamespace()[1]
+	}
 }
 
 func (this *Op) FetchData(session *mgo.Session) error {
@@ -129,10 +135,10 @@ func (this *Op) FetchData(session *mgo.Session) error {
 	}
 }
 
-func (this *Op) ParseLogEntry(entry OpLogEntry) {
+func (this *Op) ParseLogEntry(entry OpLogEntry) (include bool) {
 	this.Operation = entry["op"].(string)
 	this.Timestamp = entry["ts"].(bson.MongoTimestamp)
-	// only parse drops, inserts, deletes, and updates
+	this.Namespace = entry["ns"].(string)
 	if this.IsInsert() || this.IsDelete() || this.IsUpdate() {
 		var objectField OpLogEntry
 		if this.IsUpdate() {
@@ -141,13 +147,14 @@ func (this *Op) ParseLogEntry(entry OpLogEntry) {
 			objectField = entry["o"].(OpLogEntry)
 		}
 		this.Id = objectField["_id"]
-		this.Namespace = entry["ns"].(string)
+		include = true
 	} else if this.IsCommand() {
 		this.Data = entry["o"].(OpLogEntry)
-		if this.IsDrop() {
-			this.Namespace = entry["ns"].(string)
-		}
+		include = true
+	} else {
+		include = false
 	}
+	return
 }
 
 func OpLogCollectionName(session *mgo.Session, options *Options) string {
@@ -232,8 +239,7 @@ func TailOps(session *mgo.Session, channel OpChan, errChan chan error, options *
 		entry := make(OpLogEntry)
 		for iter.Next(entry) {
 			op := &Op{"", "", "", nil, bson.MongoTimestamp(0)}
-			op.ParseLogEntry(entry)
-			if op.Namespace != "" {
+			if op.ParseLogEntry(entry) {
 				if options.Filter == nil || options.Filter(op) {
 					channel <- op
 				}
