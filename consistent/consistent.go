@@ -28,7 +28,7 @@ func ConsistentHashFilterFromFile(name string, configFile string) (gtm.OpFilter,
 	if _, err := toml.DecodeFile(configFile, &config); err != nil {
 		return nil, EmptyWorkers
 	} else {
-		return ConsistentHashFilter(name, config.Workers), nil
+		return ConsistentHashFilter(name, config.Workers)
 	}
 }
 
@@ -39,45 +39,44 @@ func ConsistentHashFilterFromFile(name string, configFile string) (gtm.OpFilter,
 //				slice of string representing the available workers
 func ConsistentHashFilterFromDocument(name string, document map[string]interface{}) (gtm.OpFilter, error) {
 	workers := document["workers"]
-	return ConsistentHashFilter(name, workers.([]interface{})), nil
+	return ConsistentHashFilter(name, workers.([]string))
 }
 
 // returns an operation filter which uses a consistent hash to determine
 // if the operation will be accepted for processing. can be used to distribute work.
 // name:	the name of the worker creating this filter. e.g. "Harry"
 // workers:	a slice of strings representing the available worker names
-func ConsistentHashFilter(name string, workers []interface{}) (gtm.OpFilter, error) {
+func ConsistentHashFilter(name string, workers []string) (gtm.OpFilter, error) {
 	if len(workers) == 0 {
 		return nil, EmptyWorkers
 	}
 	found := false
-	ring := hashring.New()
+	ring := hashring.New(workers)
 	for _, worker := range workers {
-		next, ok := worker.(string)
-		if !ok {
-			return nil, InvalidWorkers
-		}
-		if next == name {
+		if worker == name {
 			found = true
 		}
-		ring = ring.AddNode(next)
 	}
 	if !found {
 		return nil, WorkerMissing
 	}
 	return func(op *gtm.Op) bool {
-		var idStr string
-		switch op.Id.(type) {
-		case bson.ObjectId:
-			idStr = op.Id.(bson.ObjectId).Hex()
-		default:
-			idStr = fmt.Sprintf("%v", op.Id)
-		}
-		who, ok := ring.GetNode(idStr)
-		if ok {
-			return name == who
+		if op.Id != nil {
+			var idStr string
+			switch op.Id.(type) {
+			case bson.ObjectId:
+				idStr = op.Id.(bson.ObjectId).Hex()
+			default:
+				idStr = fmt.Sprintf("%v", op.Id)
+			}
+			who, ok := ring.GetNode(idStr)
+			if ok {
+				return name == who
+			} else {
+				return false
+			}
 		} else {
-			return false
+			return true
 		}
 	}, nil
 }
