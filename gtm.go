@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+var seekChan = make(chan bson.MongoTimestamp, 1)
+var pauseChan = make(chan bool, 1)
+var resumeChan = make(chan bool, 1)
+var paused bool = false
+
 type Options struct {
 	After               TimestampGenerator
 	Filter              OpFilter
@@ -42,6 +47,24 @@ type OpLogEntry map[string]interface{}
 type OpFilter func(*Op) bool
 
 type TimestampGenerator func(*mgo.Session, *Options) bson.MongoTimestamp
+
+func Since(ts bson.MongoTimestamp) {
+	seekChan <- ts
+}
+
+func Pause() {
+	if !paused {
+		paused = true
+		pauseChan <- true
+	}
+}
+
+func Resume() {
+	if paused {
+		paused = false
+		resumeChan <- true
+	}
+}
 
 func ChainOpFilters(filters ...OpFilter) OpFilter {
 	return func(op *Op) bool {
@@ -237,6 +260,7 @@ func TailOps(session *mgo.Session, channel OpChan, errChan chan error, options *
 	iter := GetOpLogQuery(s, currTimestamp, options).Tail(duration)
 	for {
 		entry := make(OpLogEntry)
+	Seek:
 		for iter.Next(entry) {
 			op := &Op{"", "", "", nil, bson.MongoTimestamp(0)}
 			if op.ParseLogEntry(entry) {
@@ -244,14 +268,43 @@ func TailOps(session *mgo.Session, channel OpChan, errChan chan error, options *
 					channel <- op
 				}
 			}
-			currTimestamp = op.Timestamp
+			select {
+			case ts := <-seekChan:
+				currTimestamp = ts
+				break Seek
+			case <-pauseChan:
+				<-resumeChan
+				select {
+				case ts := <-seekChan:
+					currTimestamp = ts
+					break Seek
+
+				default:
+					currTimestamp = op.Timestamp
+				}
+			default:
+				currTimestamp = op.Timestamp
+			}
 		}
 		if err = iter.Close(); err != nil {
 			errChan <- err
 			return err
 		}
 		if iter.Timeout() {
-			continue
+			select {
+			case ts := <-seekChan:
+				currTimestamp = ts
+			case <-pauseChan:
+				<-resumeChan
+				select {
+				case ts := <-seekChan:
+					currTimestamp = ts
+				default:
+					continue
+				}
+			default:
+				continue
+			}
 		}
 		iter = GetOpLogQuery(s, currTimestamp, options).Tail(duration)
 	}
