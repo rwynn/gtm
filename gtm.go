@@ -20,6 +20,7 @@ type Options struct {
 	OpLogCollectionName *string
 	CursorTimeout       *string
 	ChannelSize         int
+	WorkerCount         int
 }
 
 type Op struct {
@@ -339,6 +340,7 @@ func DefaultOptions() *Options {
 		OpLogCollectionName: nil,
 		CursorTimeout:       nil,
 		ChannelSize:         20,
+		WorkerCount:         1,
 	}
 }
 
@@ -352,7 +354,10 @@ func Tail(session *mgo.Session, options *Options) (OpChan, chan error) {
 	outErr := make(chan error, options.ChannelSize)
 	inOp := make(OpChan, options.ChannelSize)
 	outOp := make(OpChan, options.ChannelSize)
-	go FetchDocuments(session, inOp, inErr, outOp, outErr)
+
+	for i := 1; i <= options.WorkerCount; i++ {
+		go FetchDocuments(session, inOp, inErr, outOp, outErr)
+	}
 	go TailOps(session, inOp, inErr, options)
 	return outOp, outErr
 }
