@@ -67,6 +67,8 @@ It can be used to send emails to new users, index documents in Solr, or somethin
 			OpLogCollectionName: nil,     	// if nil a defaults to a collection prefixed "oplog."
 			CursorTimeout:       nil,     	// if nil defaults to 100s
 			ChannelSize:         0,       	// if less than 1 defaults to 20
+			BufferSize:          25,        // if less than 1 defaults to 50. used to batch fetch documents on bursts of activity
+			BufferDuration:      0,         // if less than 1 default to 750 ms. after this timeout the batch is fetched
 		})
 	}
 
