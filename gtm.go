@@ -170,7 +170,7 @@ func (this *OpBuf) Flush(session *mgo.Session, outOp OpChan, outErr chan error) 
 		if op.IsDelete() || op.IsCommand() {
 			continue
 		}
-		idKey := fmt.Sprintf("%v", op.Id)
+		idKey := fmt.Sprintf("%s.%v", op.Namespace, op.Id)
 		ns[op.Namespace] = append(ns[op.Namespace], op.Id)
 		byId[idKey] = op
 	}
@@ -183,7 +183,7 @@ func (this *OpBuf) Flush(session *mgo.Session, outOp OpChan, outErr chan error) 
 		err := collection.Find(sel).All(&results)
 		if err == nil {
 			for _, result := range results {
-				resultId := fmt.Sprintf("%v", result["_id"])
+				resultId := fmt.Sprintf("%s.%v", n, result["_id"])
 				if mapped, ok := byId[resultId]; ok {
 					mapped.Data = result
 				}
