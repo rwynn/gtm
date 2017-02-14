@@ -23,10 +23,6 @@ It can be used to send emails to new users, index documents in Solr, or somethin
 	import "github.com/rwynn/gtm"
 	import "fmt"
 
-	func NewUsers(op *gtm.Op) bool {
-		return op.Namespace == "users.users" && op.IsInsert()
-	}
-
 	func main() {
 		// get a mgo session	
 		session, err := mgo.Dial("localhost")
@@ -45,8 +41,9 @@ It can be used to send emails to new users, index documents in Solr, or somethin
 				// handle errors
 				fmt.Println(err)
 			case op:= <-ops:
-				// op will be an insert, delete or update to mongo
-				// you can check which by calling op.IsInsert(), op.IsDelete(), or op.IsUpdate()
+				// op will be an insert, delete, update, or drop to mongo
+				// you can check which by calling 
+				// op.IsInsert(), op.IsDelete(), op.IsUpdate(), or op.IsDrop()
 				// op.Data will get you the full document for inserts and updates
 				msg := fmt.Sprintf(`Got op <%v> for object <%v> 
 				in database <%v>
@@ -58,20 +55,31 @@ It can be used to send emails to new users, index documents in Solr, or somethin
 				fmt.Println(msg) // or do something more interesting
 			}
 		}
-		// if you want to listen only for certain events on certain collections
-		// pass a filter function in options
-		ops, errs := gtm.Tail(session, &gtm.Options{
-			After:               nil,     	// if nil defaults to LastOpTimestamp
-			Filter:              NewUsers, 	// only receive inserts in the user collection
-			OpLogDatabaseName:   nil,     	// if nil defaults to "local"
-			OpLogCollectionName: nil,     	// if nil a defaults to a collection prefixed "oplog."
-			CursorTimeout:       nil,     	// if nil defaults to 100s
-			ChannelSize:         0,       	// if less than 1 defaults to 20
-			BufferSize:          25,        // if less than 1 defaults to 50. used to batch fetch documents on bursts of activity
-			BufferDuration:      0,         // if less than 1 default to 750 ms. after this timeout the batch is fetched
-		})
 	}
 
+### Configuration ###
+
+	func NewUsers(op *gtm.Op) bool {
+		return op.Namespace == "users.users" && op.IsInsert()
+	}
+
+	// if you want to listen only for certain events on certain collections
+	// pass a filter function in options
+	ops, errs := gtm.Tail(session, &gtm.Options{
+		Filter:              NewUsers, 	   // only receive inserts in the user collection
+	})
+	// more options are available for tuning
+	ops, errs := gtm.Tail(session, &gtm.Options{
+		After:               nil,     	   // if nil defaults to LastOpTimestamp
+		OpLogDatabaseName:   nil,     	   // defaults to "local"
+		OpLogCollectionName: nil,     	   // defaults to a collection prefixed "oplog."
+		CursorTimeout:       nil,     	   // defaults to 100s
+		ChannelSize:         0,       	   // defaults to 20
+		BufferSize:          25,           // defaults to 50. used to batch fetch documents on bursts of activity
+		BufferDuration:      0,            // defaults to 750 ms. after this timeout the batch is force fetched
+		WorkerCount:         8,            // defaults to 1. number of go routines batch fetching concurrently
+		Ordering:            gtm.Document, // defaults to gtm.Oplog. ordering guarantee of events on the output channel
+	})
 
 ### Advanced ###
 

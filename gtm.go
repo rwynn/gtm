@@ -2,8 +2,10 @@ package gtm
 
 import (
 	"fmt"
+	"github.com/serialx/hashring"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -12,6 +14,14 @@ var seekChan = make(chan bson.MongoTimestamp, 1)
 var pauseChan = make(chan bool, 1)
 var resumeChan = make(chan bool, 1)
 var paused bool = false
+
+type OrderingGuarantee int
+
+const (
+	Oplog     OrderingGuarantee = iota // ops sent in oplog order (strong ordering)
+	Namespace                          // ops sent in oplog order within a namespace
+	Document                           // ops sent in oplog order for a single document
+)
 
 type Options struct {
 	After               TimestampGenerator
@@ -22,6 +32,8 @@ type Options struct {
 	ChannelSize         int
 	BufferSize          int
 	BufferDuration      time.Duration
+	Ordering            OrderingGuarantee
+	WorkerCount         int
 }
 
 type Op struct {
@@ -288,10 +300,10 @@ func FillEmptyOptions(session *mgo.Session, options *Options) {
 	}
 }
 
-func TailOps(session *mgo.Session, channel OpChan, errChan chan error, options *Options) error {
+func TailOps(session *mgo.Session, channels []OpChan, errChan chan error, options *Options) error {
 	s := session.Copy()
 	defer s.Close()
-	FillEmptyOptions(session, options)
+	FillEmptyOptions(s, options)
 	duration, err := time.ParseDuration(*options.CursorTimeout)
 	if err != nil {
 		panic("Invalid value for CursorTimeout")
@@ -305,7 +317,9 @@ func TailOps(session *mgo.Session, channel OpChan, errChan chan error, options *
 			op := &Op{"", "", "", nil, bson.MongoTimestamp(0)}
 			if op.ParseLogEntry(entry) {
 				if options.Filter == nil || options.Filter(op) {
-					channel <- op
+					for _, channel := range channels {
+						channel <- op
+					}
 				}
 			}
 			select {
@@ -351,7 +365,7 @@ func TailOps(session *mgo.Session, channel OpChan, errChan chan error, options *
 	return nil
 }
 
-func FetchDocuments(session *mgo.Session, buf *OpBuf, inOp OpChan, inErr chan error,
+func FetchDocuments(session *mgo.Session, filter OpFilter, buf *OpBuf, inOp OpChan, inErr chan error,
 	outOp OpChan, outErr chan error) error {
 	s := session.Copy()
 	defer s.Close()
@@ -360,17 +374,52 @@ func FetchDocuments(session *mgo.Session, buf *OpBuf, inOp OpChan, inErr chan er
 		case err := <-inErr:
 			outErr <- err
 		case <-buf.FlushTicker.C:
-			buf.Flush(session, outOp, outErr)
+			buf.Flush(s, outOp, outErr)
 		case op := <-inOp:
-			buf.Append(op)
-			if buf.IsFull() {
-				buf.Flush(session, outOp, outErr)
-				buf.FlushTicker.Stop()
-				buf.FlushTicker = time.NewTicker(buf.BufferDuration)
+			if filter(op) {
+				buf.Append(op)
+				if buf.IsFull() {
+					buf.Flush(s, outOp, outErr)
+					buf.FlushTicker.Stop()
+					buf.FlushTicker = time.NewTicker(buf.BufferDuration)
+				}
 			}
 		}
 	}
 	return nil
+}
+
+func OpFilterForOrdering(ordering OrderingGuarantee, workers []string, worker string) OpFilter {
+	switch ordering {
+	case Document:
+		ring := hashring.New(workers)
+		return func(op *Op) bool {
+			var key string
+			if op.Id != nil {
+				key = fmt.Sprintf("%v", op.Id)
+			} else {
+				key = op.Namespace
+			}
+			if who, ok := ring.GetNode(key); ok {
+				return who == worker
+			} else {
+				return false
+			}
+		}
+	case Namespace:
+		ring := hashring.New(workers)
+		return func(op *Op) bool {
+			if who, ok := ring.GetNode(op.Namespace); ok {
+				return who == worker
+			} else {
+				return false
+			}
+		}
+	default:
+		return func(op *Op) bool {
+			return true
+		}
+	}
 }
 
 func DefaultOptions() *Options {
@@ -383,6 +432,8 @@ func DefaultOptions() *Options {
 		ChannelSize:         20,
 		BufferSize:          50,
 		BufferDuration:      time.Duration(750) * time.Millisecond,
+		Ordering:            Oplog,
+		WorkerCount:         1,
 	}
 }
 
@@ -397,6 +448,12 @@ func (this *Options) SetDefaults() {
 	if this.BufferDuration < 1 {
 		this.BufferDuration = defaultOpts.BufferDuration
 	}
+	if this.Ordering == Oplog {
+		this.WorkerCount = 1
+	}
+	if this.WorkerCount < 1 {
+		this.WorkerCount = 1
+	}
 }
 
 func Tail(session *mgo.Session, options *Options) (OpChan, chan error) {
@@ -405,16 +462,32 @@ func Tail(session *mgo.Session, options *Options) (OpChan, chan error) {
 	} else {
 		options.SetDefaults()
 	}
+
 	inErr := make(chan error, options.ChannelSize)
 	outErr := make(chan error, options.ChannelSize)
-	inOp := make(OpChan, options.ChannelSize)
 	outOp := make(OpChan, options.ChannelSize)
-	buf := &OpBuf{
-		BufferSize:     options.BufferSize,
-		BufferDuration: options.BufferDuration,
-		FlushTicker:    time.NewTicker(options.BufferDuration),
+
+	var inOps []OpChan
+	var workerNames []string
+
+	for i := 1; i <= options.WorkerCount; i++ {
+		workerNames = append(workerNames, strconv.Itoa(i))
 	}
-	go FetchDocuments(session, buf, inOp, inErr, outOp, outErr)
-	go TailOps(session, inOp, inErr, options)
+
+	for i := 1; i <= options.WorkerCount; i++ {
+		inOp := make(OpChan, options.ChannelSize)
+		inOps = append(inOps, inOp)
+		buf := &OpBuf{
+			BufferSize:     options.BufferSize,
+			BufferDuration: options.BufferDuration,
+			FlushTicker:    time.NewTicker(options.BufferDuration),
+		}
+		worker := strconv.Itoa(i)
+		filter := OpFilterForOrdering(options.Ordering, workerNames, worker)
+		go FetchDocuments(session, filter, buf, inOp, inErr, outOp, outErr)
+	}
+
+	go TailOps(session, inOps, inErr, options)
+
 	return outOp, outErr
 }
