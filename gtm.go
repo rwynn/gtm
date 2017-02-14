@@ -445,7 +445,7 @@ func (this *Options) SetDefaults() {
 	if this.BufferSize < 1 {
 		this.BufferSize = defaultOpts.BufferSize
 	}
-	if this.BufferDuration < 1 {
+	if this.BufferDuration == 0 {
 		this.BufferDuration = defaultOpts.BufferDuration
 	}
 	if this.Ordering == Oplog {
