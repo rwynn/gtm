@@ -177,14 +177,14 @@ func (this *OpBuf) Flush(session *mgo.Session, outOp OpChan, outErr chan error) 
 		return
 	}
 	ns := make(map[string][]interface{})
-	byId := make(map[interface{}]*Op)
+	byId := make(map[interface{}][]*Op)
 	for _, op := range this.Entries {
 		if op.IsDelete() || op.IsCommand() {
 			continue
 		}
 		idKey := fmt.Sprintf("%s.%v", op.Namespace, op.Id)
 		ns[op.Namespace] = append(ns[op.Namespace], op.Id)
-		byId[idKey] = op
+		byId[idKey] = append(byId[idKey], op)
 	}
 	for n, opIds := range ns {
 		var parts = strings.SplitN(n, ".", 2)
@@ -197,7 +197,9 @@ func (this *OpBuf) Flush(session *mgo.Session, outOp OpChan, outErr chan error) 
 			for _, result := range results {
 				resultId := fmt.Sprintf("%s.%v", n, result["_id"])
 				if mapped, ok := byId[resultId]; ok {
-					mapped.Data = result
+					for _, o := range mapped {
+						o.Data = result
+					}
 				}
 			}
 		} else {
