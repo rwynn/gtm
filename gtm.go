@@ -281,7 +281,7 @@ func LastOpTimestamp(session *mgo.Session, options *Options) bson.MongoTimestamp
 }
 
 func GetOpLogQuery(session *mgo.Session, after bson.MongoTimestamp, options *Options) *mgo.Query {
-	query := bson.M{"ts": bson.M{"$gt": after}}
+	query := bson.M{"ts": bson.M{"$gt": after}, "fromMigrate": bson.M{"$exists": false}}
 	collection := OpLogCollection(session, options)
 	return collection.Find(query).LogReplay().Sort("$natural")
 }
