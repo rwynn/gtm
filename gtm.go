@@ -179,12 +179,11 @@ func (this *OpBuf) Flush(session *mgo.Session, outOp OpChan, outErr chan error) 
 	ns := make(map[string][]interface{})
 	byId := make(map[interface{}][]*Op)
 	for _, op := range this.Entries {
-		if op.IsDelete() || op.IsCommand() {
-			continue
+		if op.IsUpdate() {
+			idKey := fmt.Sprintf("%s.%v", op.Namespace, op.Id)
+			ns[op.Namespace] = append(ns[op.Namespace], op.Id)
+			byId[idKey] = append(byId[idKey], op)
 		}
-		idKey := fmt.Sprintf("%s.%v", op.Namespace, op.Id)
-		ns[op.Namespace] = append(ns[op.Namespace], op.Id)
-		byId[idKey] = append(byId[idKey], op)
 	}
 	for n, opIds := range ns {
 		var parts = strings.SplitN(n, ".", 2)
@@ -224,6 +223,9 @@ func (this *Op) ParseLogEntry(entry OpLogEntry) (include bool) {
 			objectField = entry["o"].(OpLogEntry)
 		}
 		this.Id = objectField["_id"]
+		if this.IsInsert() {
+			this.Data = objectField
+		}
 		include = true
 	} else if this.IsCommand() {
 		this.Data = entry["o"].(OpLogEntry)
