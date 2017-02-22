@@ -257,7 +257,7 @@ func OpLogCollectionName(session *mgo.Session, options *Options) string {
 		}
 	} else {
 		msg := fmt.Sprintf(`Unable to get collection names 
-				for database %v`, *options.OpLogDatabaseName)
+		for database %v: %s`, *options.OpLogDatabaseName, err)
 		panic(msg)
 	}
 }
