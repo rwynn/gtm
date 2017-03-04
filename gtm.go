@@ -32,6 +32,7 @@ type Options struct {
 	WorkerCount         int
 	UpdateDataAsDelta   bool
 	DirectReadNs        []string
+	DirectReadersPerCol int
 	DirectReadLimit     int
 }
 
@@ -307,7 +308,7 @@ func GetOpLogQuery(session *mgo.Session, after bson.MongoTimestamp, options *Opt
 	return collection.Find(query).LogReplay().Sort("$natural")
 }
 
-func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, errChan chan error, options *Options) error {
+func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Options) error {
 	defer ctx.allWg.Done()
 	s := session.Copy()
 	defer s.Close()
@@ -325,8 +326,13 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, errChan chan e
 			op := &Op{"", "", "", nil, bson.MongoTimestamp(0)}
 			if op.ParseLogEntry(entry, options) {
 				if options.Filter == nil || options.Filter(op) {
-					for _, channel := range channels {
-						channel <- op
+					if options.UpdateDataAsDelta {
+						ctx.OpC <- op
+					} else {
+						// broadcast to fetch channels
+						for _, channel := range channels {
+							channel <- op
+						}
 					}
 				}
 			}
@@ -352,7 +358,7 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, errChan chan e
 			}
 		}
 		if err = iter.Close(); err != nil {
-			errChan <- err
+			ctx.ErrC <- err
 			return err
 		}
 		if iter.Timeout() {
@@ -378,12 +384,12 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, errChan chan e
 	return nil
 }
 
-func DirectRead(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (err error) {
+func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *Options) (err error) {
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
 	s := session.Copy()
 	defer s.Close()
-	skip, limit := 0, options.DirectReadLimit
+	skip, limit := idx*options.DirectReadLimit, options.DirectReadLimit
 	dbCol := strings.SplitN(ns, ".", 2)
 	if len(dbCol) != 2 {
 		err = fmt.Errorf("Invalid direct read ns: %s :expecting db.collection", ns)
@@ -414,7 +420,7 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (
 		if count < limit {
 			break
 		}
-		skip = skip + limit
+		skip = skip + (limit * options.DirectReadersPerCol)
 		select {
 		case <-ctx.stopC:
 			return nil
@@ -425,32 +431,23 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (
 	return
 }
 
-func FetchDocuments(ctx *OpCtx, session *mgo.Session, filter OpFilter, buf *OpBuf, inOp OpChan, inErr chan error, options *Options) error {
+func FetchDocuments(ctx *OpCtx, session *mgo.Session, filter OpFilter, buf *OpBuf, inOp OpChan) error {
 	defer ctx.allWg.Done()
 	s := session.Copy()
 	defer s.Close()
-	if options.UpdateDataAsDelta {
-		buf.FlushTicker.Stop()
-	}
 	for {
 		select {
 		case <-ctx.stopC:
 			return nil
-		case err := <-inErr:
-			ctx.ErrC <- err
 		case <-buf.FlushTicker.C:
 			buf.Flush(s, ctx)
 		case op := <-inOp:
-			if options.UpdateDataAsDelta {
-				ctx.OpC <- op
-			} else {
-				if filter(op) {
-					buf.Append(op)
-					if buf.IsFull() {
-						buf.Flush(s, ctx)
-						buf.FlushTicker.Stop()
-						buf.FlushTicker = time.NewTicker(buf.BufferDuration)
-					}
+			if filter(op) {
+				buf.Append(op)
+				if buf.IsFull() {
+					buf.Flush(s, ctx)
+					buf.FlushTicker.Stop()
+					buf.FlushTicker = time.NewTicker(buf.BufferDuration)
 				}
 			}
 		}
@@ -506,6 +503,7 @@ func DefaultOptions() *Options {
 		UpdateDataAsDelta:   false,
 		DirectReadNs:        []string{},
 		DirectReadLimit:     100,
+		DirectReadersPerCol: 3,
 	}
 }
 
@@ -546,10 +544,13 @@ func (this *Options) SetDefaults() {
 	}
 	if this.UpdateDataAsDelta {
 		this.Ordering = Oplog
-		this.WorkerCount = 1
+		this.WorkerCount = 0
 	}
 	if this.DirectReadLimit == 0 {
 		this.DirectReadLimit = defaultOpts.DirectReadLimit
+	}
+	if this.DirectReadersPerCol == 0 {
+		this.DirectReadersPerCol = defaultOpts.DirectReadersPerCol
 	}
 }
 
@@ -565,11 +566,10 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 		options.SetDefaults()
 	}
 
-	routines := options.WorkerCount + len(options.DirectReadNs) + 1
+	routines := options.WorkerCount + (len(options.DirectReadNs) * options.DirectReadersPerCol) + 1
 	stopC := make(chan bool, routines)
-	inErr := make(chan error, options.ChannelSize)
-	outErr := make(chan error, options.ChannelSize)
-	outOp := make(OpChan, options.ChannelSize)
+	errC := make(chan error, options.ChannelSize)
+	opC := make(OpChan, options.ChannelSize)
 
 	var inOps []OpChan
 	var workerNames []string
@@ -580,8 +580,8 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 	var resumeC = make(chan bool, 1)
 
 	ctx := &OpCtx{
-		OpC:          outOp,
-		ErrC:         outErr,
+		OpC:          opC,
+		ErrC:         errC,
 		DirectReadWg: &directReadWg,
 		routines:     routines,
 		stopC:        stopC,
@@ -606,17 +606,19 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 		}
 		worker := strconv.Itoa(i)
 		filter := OpFilterForOrdering(options.Ordering, workerNames, worker)
-		go FetchDocuments(ctx, session, filter, buf, inOp, inErr, options)
+		go FetchDocuments(ctx, session, filter, buf, inOp)
 	}
 
 	for _, ns := range options.DirectReadNs {
-		directReadWg.Add(1)
-		allWg.Add(1)
-		go DirectRead(ctx, session, ns, options)
+		for i := 0; i < options.DirectReadersPerCol; i++ {
+			directReadWg.Add(1)
+			allWg.Add(1)
+			go DirectRead(ctx, session, i, ns, options)
+		}
 	}
 
 	allWg.Add(1)
-	go TailOps(ctx, session, inOps, inErr, options)
+	go TailOps(ctx, session, inOps, options)
 
 	return ctx
 }
