@@ -415,6 +415,12 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 				Namespace: ns,
 				Data:      result,
 			}
+			switch op.Id.(type) {
+			case bson.ObjectId:
+				// set timestamp based on id
+				t := op.Id.(bson.ObjectId).Time().UTC().Unix()
+				op.Timestamp = bson.MongoTimestamp(t << 32)
+			}
 			ctx.OpC <- op
 		}
 		if count < limit {
