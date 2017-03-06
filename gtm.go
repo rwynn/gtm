@@ -501,7 +501,7 @@ func DefaultOptions() *Options {
 		OpLogDatabaseName:   nil,
 		OpLogCollectionName: nil,
 		CursorTimeout:       nil,
-		ChannelSize:         20,
+		ChannelSize:         512,
 		BufferSize:          50,
 		BufferDuration:      time.Duration(750) * time.Millisecond,
 		Ordering:            Oplog,
