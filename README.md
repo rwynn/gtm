@@ -1,7 +1,8 @@
 gtm
 ===
 gtm (go tail mongo) is a utility written in Go which tails the MongoDB oplog and sends create, update, delete events to your code.
-It can be used to send emails to new users, [index documents](https://www.github.com/rwynn/monstache), or something else.
+It can be used to send emails to new users, [index documents](https://www.github.com/rwynn/monstache), 
+[write time series data](https://www.github.com/rwynn/mongofluxd), or something else.
 
 ### Requirements ###
 + [Go](http://golang.org/doc/install)
