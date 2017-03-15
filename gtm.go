@@ -215,9 +215,17 @@ func (this *OpBuf) Flush(session *mgo.Session, ctx *OpCtx) {
 		if err == nil {
 			for _, result := range results {
 				resultId := fmt.Sprintf("%s.%v", n, result["_id"])
-				if mapped, ok := byId[resultId]; ok {
-					for _, o := range mapped {
-						o.Data = result
+				if ops, ok := byId[resultId]; ok {
+					if len(ops) == 1 {
+						ops[0].Data = result
+					} else {
+						for _, o := range ops {
+							data := make(map[string]interface{})
+							for k, v := range result {
+								data[k] = v
+							}
+							o.Data = data
+						}
 					}
 				}
 			}
