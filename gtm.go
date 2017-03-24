@@ -199,7 +199,7 @@ func (this *OpBuf) Flush(session *mgo.Session, ctx *OpCtx) {
 	ns := make(map[string][]interface{})
 	byId := make(map[interface{}][]*Op)
 	for _, op := range this.Entries {
-		if op.IsUpdate() {
+		if op.IsUpdate() && op.Data == nil {
 			idKey := fmt.Sprintf("%s.%v", op.Namespace, op.Id)
 			ns[op.Namespace] = append(ns[op.Namespace], op.Id)
 			byId[idKey] = append(byId[idKey], op)
@@ -239,6 +239,17 @@ func (this *OpBuf) Flush(session *mgo.Session, ctx *OpCtx) {
 	this.Entries = nil
 }
 
+func UpdateIsReplace(entry OpLogEntry) bool {
+	if _, ok := entry["$set"]; ok {
+		return false
+	} else if _, ok := entry["$unset"]; ok {
+		return false
+	} else {
+		return true
+
+	}
+}
+
 func (this *Op) ParseLogEntry(entry OpLogEntry, options *Options) (include bool) {
 	this.Operation = entry["op"].(string)
 	this.Timestamp = entry["ts"].(bson.MongoTimestamp)
@@ -253,8 +264,11 @@ func (this *Op) ParseLogEntry(entry OpLogEntry, options *Options) (include bool)
 		this.Id = objectField["_id"]
 		if this.IsInsert() {
 			this.Data = objectField
-		} else if this.IsUpdate() && options.UpdateDataAsDelta {
-			this.Data = entry["o"].(OpLogEntry)
+		} else if this.IsUpdate() {
+			var changeField = entry["o"].(OpLogEntry)
+			if options.UpdateDataAsDelta || UpdateIsReplace(changeField) {
+				this.Data = changeField
+			}
 		}
 		include = true
 	} else if this.IsCommand() {
