@@ -381,7 +381,6 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 		}
 		if err = iter.Close(); err != nil {
 			ctx.ErrC <- err
-			return err
 		}
 		if iter.Timeout() {
 			select {
