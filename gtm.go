@@ -41,6 +41,7 @@ type Options struct {
 	DirectReadNs        []string
 	DirectReadersPerCol int
 	DirectReadLimit     int
+	DirectReadFilter    OpFilter
 }
 
 type Op struct {
@@ -466,7 +467,9 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 				t := op.Id.(bson.ObjectId).Time().UTC().Unix()
 				op.Timestamp = bson.MongoTimestamp(t << 32)
 			}
-			ctx.OpC <- op
+			if options.DirectReadFilter == nil || options.DirectReadFilter(op) {
+				ctx.OpC <- op
+			}
 		}
 		if count < limit {
 			break
@@ -555,6 +558,7 @@ func DefaultOptions() *Options {
 		DirectReadNs:        []string{},
 		DirectReadLimit:     100,
 		DirectReadersPerCol: 3,
+		DirectReadFilter:    nil,
 	}
 }
 
