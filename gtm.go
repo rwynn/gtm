@@ -19,6 +19,13 @@ const (
 	Document                           // ops sent in oplog order for a single document
 )
 
+type QuerySource int
+
+const (
+	OplogQuerySource QuerySource = iota
+	DirectQuerySource
+)
+
 type Options struct {
 	After               TimestampGenerator
 	Filter              OpFilter
@@ -42,6 +49,7 @@ type Op struct {
 	Namespace string                 `json:"namespace"`
 	Data      map[string]interface{} `json:"data"`
 	Timestamp bson.MongoTimestamp    `json:"timestamp"`
+	Source    QuerySource            `json:"source"`
 }
 
 type OpLog struct {
@@ -164,6 +172,14 @@ func (this *Op) IsUpdate() bool {
 
 func (this *Op) IsDelete() bool {
 	return this.Operation == "d"
+}
+
+func (this *Op) IsSourceOplog() bool {
+	return this.Source == OplogQuerySource
+}
+
+func (this *Op) IsSourceDirect() bool {
+	return this.Source == DirectQuerySource
 }
 
 func (this *Op) ParseNamespace() []string {
@@ -345,7 +361,14 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 		entry := make(OpLogEntry)
 	Seek:
 		for iter.Next(entry) {
-			op := &Op{"", "", "", nil, bson.MongoTimestamp(0)}
+			op := &Op{
+				Id:        "",
+				Operation: "",
+				Namespace: "",
+				Data:      nil,
+				Timestamp: bson.MongoTimestamp(0),
+				Source:    OplogQuerySource,
+			}
 			if op.ParseLogEntry(entry, options) {
 				if options.Filter == nil || options.Filter(op) {
 					if options.UpdateDataAsDelta {
@@ -435,6 +458,7 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 				Operation: "i",
 				Namespace: ns,
 				Data:      result,
+				Source:    DirectQuerySource,
 			}
 			switch op.Id.(type) {
 			case bson.ObjectId:
