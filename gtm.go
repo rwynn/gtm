@@ -443,17 +443,15 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 	}
 	db, col := dbCol[0], dbCol[1]
 	c := s.DB(db).C(col)
+	q := c.Find(nil).Limit(limit).Sort("_id").Hint("_id")
 	for {
-		var results []map[string]interface{}
-		if err = c.Find(nil).Skip(skip).Limit(limit).Sort("$natural").All(&results); err != nil {
-			ctx.ErrC <- err
+		q.Skip(skip)
+		iter := q.Iter()
+		if iter.Done() {
 			break
 		}
-		count := len(results)
-		if count == 0 {
-			break
-		}
-		for _, result := range results {
+		result := make(map[string]interface{})
+		for iter.Next(&result) {
 			op := &Op{
 				Id:        result["_id"],
 				Operation: "i",
@@ -470,8 +468,10 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 			if options.DirectReadFilter == nil || options.DirectReadFilter(op) {
 				ctx.OpC <- op
 			}
+			result = make(map[string]interface{})
 		}
-		if count < limit {
+		if err = iter.Close(); err != nil {
+			ctx.ErrC <- err
 			break
 		}
 		skip = skip + (limit * options.DirectReadersPerCol)
@@ -481,6 +481,7 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 		default:
 			continue
 		}
+
 	}
 	return
 }
@@ -556,8 +557,8 @@ func DefaultOptions() *Options {
 		WorkerCount:         1,
 		UpdateDataAsDelta:   false,
 		DirectReadNs:        []string{},
-		DirectReadLimit:     100,
-		DirectReadersPerCol: 3,
+		DirectReadLimit:     5000,
+		DirectReadersPerCol: 10,
 		DirectReadFilter:    nil,
 	}
 }
