@@ -42,6 +42,7 @@ type Options struct {
 	DirectReadersPerCol int
 	DirectReadLimit     int
 	DirectReadFilter    OpFilter
+	DirectReadBatchSize int
 }
 
 type Op struct {
@@ -434,7 +435,7 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 	defer ctx.DirectReadWg.Done()
 	s := session.Copy()
 	defer s.Close()
-	skip, limit := idx*options.DirectReadLimit, options.DirectReadLimit
+	skip, limit := int64(idx*options.DirectReadLimit), options.DirectReadLimit
 	dbCol := strings.SplitN(ns, ".", 2)
 	if len(dbCol) != 2 {
 		err = fmt.Errorf("Invalid direct read ns: %s :expecting db.collection", ns)
@@ -443,11 +444,14 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 	}
 	db, col := dbCol[0], dbCol[1]
 	c := s.DB(db).C(col)
-	q := c.Find(nil).Limit(limit).Sort("_id").Hint("_id")
+	q := c.Find(nil).Limit(limit).Sort("_id").Hint("_id").Batch(options.DirectReadBatchSize)
 	for {
 		q.Skip(skip)
 		iter := q.Iter()
 		if iter.Done() {
+			if err = iter.Close(); err != nil {
+				ctx.ErrC <- err
+			}
 			break
 		}
 		result := make(map[string]interface{})
@@ -477,7 +481,7 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 		skip = skip + (limit * options.DirectReadersPerCol)
 		select {
 		case <-ctx.stopC:
-			return nil
+			return
 		default:
 			continue
 		}
@@ -560,6 +564,7 @@ func DefaultOptions() *Options {
 		DirectReadLimit:     5000,
 		DirectReadersPerCol: 10,
 		DirectReadFilter:    nil,
+		DirectReadBatchSize: 500,
 	}
 }
 
@@ -607,6 +612,9 @@ func (this *Options) SetDefaults() {
 	}
 	if this.DirectReadersPerCol == 0 {
 		this.DirectReadersPerCol = defaultOpts.DirectReadersPerCol
+	}
+	if this.DirectReadBatchSize < 1 {
+		this.DirectReadBatchSize = defaultOpts.DirectReadBatchSize
 	}
 }
 
