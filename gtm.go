@@ -435,7 +435,7 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 	defer ctx.DirectReadWg.Done()
 	s := session.Copy()
 	defer s.Close()
-	skip, limit := int64(idx*options.DirectReadLimit), options.DirectReadLimit
+	skip, limit := idx*options.DirectReadLimit, options.DirectReadLimit
 	dbCol := strings.SplitN(ns, ".", 2)
 	if len(dbCol) != 2 {
 		err = fmt.Errorf("Invalid direct read ns: %s :expecting db.collection", ns)
