@@ -97,7 +97,7 @@ You can wait till all the collections have been fully read by using the DirectRe
 	go func() {
 		ctx.DirectReadWg.Wait()
 		fmt.Println("direct reads are done")
-	}
+	}()
 
 ### Advanced ###
 
