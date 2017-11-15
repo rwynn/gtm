@@ -60,8 +60,8 @@ type OpLog struct {
 	MongoVersion int                 "v"
 	Operation    string              "op"
 	Namespace    string              "ns"
-	Object       bson.M              "o"
-	QueryObject  bson.M              "o2"
+	Doc          *bson.Raw           "o"
+	Update       *bson.Raw           "o2"
 }
 
 type OpChan chan *Op
@@ -257,7 +257,7 @@ func (this *OpBuf) Flush(session *mgo.Session, ctx *OpCtx) {
 	this.Entries = nil
 }
 
-func UpdateIsReplace(entry OpLogEntry) bool {
+func UpdateIsReplace(entry map[string]interface{}) bool {
 	if _, ok := entry["$set"]; ok {
 		return false
 	} else if _, ok := entry["$unset"]; ok {
@@ -268,29 +268,36 @@ func UpdateIsReplace(entry OpLogEntry) bool {
 	}
 }
 
-func (this *Op) ParseLogEntry(entry OpLogEntry, options *Options) (include bool) {
-	this.Operation = entry["op"].(string)
-	this.Timestamp = entry["ts"].(bson.MongoTimestamp)
-	this.Namespace = entry["ns"].(string)
+func (this *Op) ParseLogEntry(entry *OpLog, options *Options) (include bool) {
+	var rawField *bson.Raw
+	var objectField map[string]interface{}
+	this.Operation = entry.Operation
+	this.Timestamp = entry.Timestamp
+	this.Namespace = entry.Namespace
 	if this.IsInsert() || this.IsDelete() || this.IsUpdate() {
-		var objectField OpLogEntry
 		if this.IsUpdate() {
-			objectField = entry["o2"].(OpLogEntry)
+			rawField = entry.Update
+			rawField.Unmarshal(&objectField)
 		} else {
-			objectField = entry["o"].(OpLogEntry)
+			rawField = entry.Doc
+			rawField.Unmarshal(&objectField)
 		}
 		this.Id = objectField["_id"]
 		if this.IsInsert() {
 			this.Data = objectField
 		} else if this.IsUpdate() {
-			var changeField = entry["o"].(OpLogEntry)
+			var changeField map[string]interface{}
+			rawField = entry.Doc
+			rawField.Unmarshal(&changeField)
 			if options.UpdateDataAsDelta || UpdateIsReplace(changeField) {
 				this.Data = changeField
 			}
 		}
 		include = true
 	} else if this.IsCommand() {
-		this.Data = entry["o"].(OpLogEntry)
+		rawField = entry.Doc
+		rawField.Unmarshal(&objectField)
+		this.Data = objectField
 		include = this.IsDrop()
 	} else {
 		include = false
@@ -360,9 +367,9 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 	currTimestamp := options.After(s, options)
 	iter := GetOpLogQuery(s, currTimestamp, options).Tail(duration)
 	for {
-		entry := make(OpLogEntry)
+		var entry OpLog
 	Seek:
-		for iter.Next(entry) {
+		for iter.Next(&entry) {
 			op := &Op{
 				Id:        "",
 				Operation: "",
@@ -371,7 +378,7 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 				Timestamp: bson.MongoTimestamp(0),
 				Source:    OplogQuerySource,
 			}
-			if op.ParseLogEntry(entry, options) {
+			if op.ParseLogEntry(&entry, options) {
 				if options.Filter == nil || options.Filter(op) {
 					if options.UpdateDataAsDelta {
 						ctx.OpC <- op
