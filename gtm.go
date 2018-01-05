@@ -92,6 +92,32 @@ type OpCtx struct {
 	paused       bool
 }
 
+type OpCtxMulti struct {
+	Contexts     []*OpCtx
+	OpC          OpChan
+	ErrC         chan error
+	DirectReadWg *sync.WaitGroup
+	stopC        chan bool
+	allWg        *sync.WaitGroup
+	seekC        chan bson.MongoTimestamp
+	pauseC       chan bool
+	resumeC      chan bool
+	paused       bool
+}
+
+type ShardInfo struct {
+	hostname string
+}
+
+func (shard *ShardInfo) GetURL() string {
+	hostParts := strings.SplitN(shard.hostname, "/", 2)
+	if len(hostParts) == 2 {
+		return hostParts[1] + "?replicaSet=" + hostParts[0]
+	} else {
+		return hostParts[0]
+	}
+}
+
 func (ctx *OpCtx) Since(ts bson.MongoTimestamp) {
 	ctx.seekC <- ts
 }
@@ -113,6 +139,37 @@ func (ctx *OpCtx) Resume() {
 func (ctx *OpCtx) Stop() {
 	for i := 1; i <= ctx.routines; i++ {
 		ctx.stopC <- true
+	}
+	ctx.allWg.Wait()
+}
+
+func (ctx *OpCtxMulti) Since(ts bson.MongoTimestamp) {
+	for _, child := range ctx.Contexts {
+		child.Since(ts)
+	}
+}
+
+func (ctx *OpCtxMulti) Pause() {
+	if !ctx.paused {
+		ctx.paused = true
+		for _, child := range ctx.Contexts {
+			child.Pause()
+		}
+	}
+}
+
+func (ctx *OpCtxMulti) Resume() {
+	if ctx.paused {
+		ctx.paused = false
+		for _, child := range ctx.Contexts {
+			child.Resume()
+		}
+	}
+}
+
+func (ctx *OpCtxMulti) Stop() {
+	for _, child := range ctx.Contexts {
+		child.Stop()
 	}
 	ctx.allWg.Wait()
 }
@@ -628,6 +685,77 @@ func (this *Options) SetDefaults() {
 func Tail(session *mgo.Session, options *Options) (OpChan, chan error) {
 	ctx := Start(session, options)
 	return ctx.OpC, ctx.ErrC
+}
+
+func GetShards(session *mgo.Session) (shardInfos []*ShardInfo) {
+	// use this for sharded databases to get the shard hosts
+	// use the hostnames to create multiple sessions for a call to StartMulti
+	col := session.DB("config").C("shards")
+	var shards []map[string]interface{}
+	col.Find(nil).All(&shards)
+	for _, shard := range shards {
+		host := shard["host"].(string)
+		shardInfo := &ShardInfo{
+			hostname: host,
+		}
+		shardInfos = append(shardInfos, shardInfo)
+	}
+	return
+}
+
+func StartMulti(sessions []*mgo.Session, options *Options) *OpCtxMulti {
+	if options == nil {
+		options = DefaultOptions()
+	} else {
+		options.SetDefaults()
+	}
+
+	stopC := make(chan bool, 1)
+	errC := make(chan error, options.ChannelSize)
+	opC := make(OpChan, options.ChannelSize)
+
+	var directReadWg sync.WaitGroup
+	var allWg sync.WaitGroup
+	var seekC = make(chan bson.MongoTimestamp, 1)
+	var pauseC = make(chan bool, 1)
+	var resumeC = make(chan bool, 1)
+
+	ctxMulti := &OpCtxMulti{
+		OpC:          opC,
+		ErrC:         errC,
+		DirectReadWg: &directReadWg,
+		stopC:        stopC,
+		allWg:        &allWg,
+		pauseC:       pauseC,
+		resumeC:      resumeC,
+		seekC:        seekC,
+	}
+
+	for _, session := range sessions {
+		ctx := Start(session, options)
+		ctxMulti.Contexts = append(ctxMulti.Contexts, ctx)
+		go func() {
+			directReadWg.Add(1)
+			defer directReadWg.Done()
+			ctx.DirectReadWg.Wait()
+		}()
+		go func() {
+			allWg.Add(1)
+			defer allWg.Done()
+			ctx.allWg.Wait()
+		}()
+		go func(c OpChan) {
+			for op := range c {
+				opC <- op
+			}
+		}(ctx.OpC)
+		go func(c chan error) {
+			for err := range c {
+				errC <- err
+			}
+		}(ctx.ErrC)
+	}
+	return ctxMulti
 }
 
 func Start(session *mgo.Session, options *Options) *OpCtx {
