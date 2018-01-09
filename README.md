@@ -99,6 +99,50 @@ You can wait till all the collections have been fully read by using the DirectRe
 		fmt.Println("direct reads are done")
 	}()
 
+### Sharded Clusters ###
+
+gtm has support for sharded MongoDB clusters.  You will want to start with a connection to the MongoDBconfig server to get the list of available shards.
+
+    // assuming the config server for a sharded cluster is running locally on port 27018
+    configSession, err = mgo.Dial("127.0.0.1:27018")
+    if err != nil {
+        panic(err)
+    }
+    // get the list of shard servers
+    shardInfos := gtm.GetShards(configSession)
+
+for each shard you will create a session and append it to a slice of sessions
+
+    var shardSessions []*mgo.Session
+    // add each shard server to the sync list
+    for _, shardInfo := range shardInfos {
+        log.Printf("Adding shard found at %s\n", shardInfo.GetURL())
+        shardURL := shardInfo.GetURL()
+        shard, err := mgo.Dial(shardURL)
+        if err != nil {
+            panic(err)
+        }
+        shardSessions = append(shardSessions, shard)
+    }
+
+finally you will want to start a multi context.  The multi context behaves just like a single
+context except that it tails multiple shard servers and coalesces the events to a single output
+channel
+
+	multiCtx := gtm.StartMulti(shardSessions, nil)
+
+after you have created the multi context for all the shards you can handle new shards being added
+to the cluster at some later time by adding a listener. You will want to add this listener before 
+you enter a loop to read events from the multi context.
+
+	insertHandler := func(shardInfo *gtm.ShardInfo) (*mgo.Session, error) {
+		log.Printf("Adding shard found at %s\n", shardInfo.GetURL())
+        shardURL := shardInfo.GetURL()
+        return mgo.Dial(shardURL)
+	}
+
+    multiCtx.AddShardListener(configSession, nil, insertHandler)
+
 ### Advanced ###
 
 You may want to distribute event handling between a set of worker processes on different machines.

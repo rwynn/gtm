@@ -70,6 +70,8 @@ type OpLogEntry map[string]interface{}
 
 type OpFilter func(*Op) bool
 
+type ShardInsertHandler func(*ShardInfo) (*mgo.Session, error)
+
 type TimestampGenerator func(*mgo.Session, *Options) bson.MongoTimestamp
 
 type OpBuf struct {
@@ -93,7 +95,8 @@ type OpCtx struct {
 }
 
 type OpCtxMulti struct {
-	Contexts     []*OpCtx
+	lock         *sync.Mutex
+	contexts     []*OpCtx
 	OpC          OpChan
 	ErrC         chan error
 	DirectReadWg *sync.WaitGroup
@@ -144,34 +147,113 @@ func (ctx *OpCtx) Stop() {
 }
 
 func (ctx *OpCtxMulti) Since(ts bson.MongoTimestamp) {
-	for _, child := range ctx.Contexts {
+	ctx.lock.Lock()
+	defer ctx.lock.Unlock()
+	for _, child := range ctx.contexts {
 		child.Since(ts)
 	}
 }
 
 func (ctx *OpCtxMulti) Pause() {
+	ctx.lock.Lock()
+	defer ctx.lock.Unlock()
 	if !ctx.paused {
 		ctx.paused = true
-		for _, child := range ctx.Contexts {
+		ctx.pauseC <- true
+		for _, child := range ctx.contexts {
 			child.Pause()
 		}
 	}
 }
 
 func (ctx *OpCtxMulti) Resume() {
+	ctx.lock.Lock()
+	defer ctx.lock.Unlock()
 	if ctx.paused {
 		ctx.paused = false
-		for _, child := range ctx.Contexts {
+		ctx.resumeC <- true
+		for _, child := range ctx.contexts {
 			child.Resume()
 		}
 	}
 }
 
 func (ctx *OpCtxMulti) Stop() {
-	for _, child := range ctx.Contexts {
-		child.Stop()
+	ctx.lock.Lock()
+	defer ctx.lock.Unlock()
+	ctx.stopC <- true
+	for _, child := range ctx.contexts {
+		go child.Stop()
 	}
 	ctx.allWg.Wait()
+}
+
+func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardInsertHandler) {
+	defer multi.allWg.Done()
+	if options == nil {
+		options = DefaultOptions()
+	} else {
+		options.SetDefaults()
+	}
+	for {
+		select {
+		case <-multi.stopC:
+			return
+		case <-multi.pauseC:
+			<-multi.resumeC
+			select {
+			case <-multi.stopC:
+				return
+			}
+		case err := <-ctx.ErrC:
+			multi.ErrC <- err
+		case op := <-ctx.OpC:
+			// new shard detected
+			shardInfo := &ShardInfo{
+				hostname: op.Data["host"].(string),
+			}
+			shardSession, err := handler(shardInfo)
+			if err != nil {
+				multi.ErrC <- err
+				continue
+			}
+			shardCtx := Start(shardSession, options)
+			multi.lock.Lock()
+			multi.contexts = append(multi.contexts, shardCtx)
+			go func() {
+				multi.DirectReadWg.Add(1)
+				defer multi.DirectReadWg.Done()
+				shardCtx.DirectReadWg.Wait()
+			}()
+			go func() {
+				multi.allWg.Add(1)
+				defer multi.allWg.Done()
+				shardCtx.allWg.Wait()
+			}()
+			go func(c OpChan) {
+				for op := range c {
+					multi.OpC <- op
+				}
+			}(shardCtx.OpC)
+			go func(c chan error) {
+				for err := range c {
+					multi.ErrC <- err
+				}
+			}(shardCtx.ErrC)
+			multi.lock.Unlock()
+		}
+	}
+}
+
+func (ctx *OpCtxMulti) AddShardListener(
+	configSession *mgo.Session, shardOptions *Options, handler ShardInsertHandler) {
+	opts := DefaultOptions()
+	opts.Filter = func(op *Op) bool {
+		return op.Namespace == "config.shards" && op.IsInsert()
+	}
+	configCtx := Start(configSession, opts)
+	ctx.allWg.Add(1)
+	go tailShards(ctx, configCtx, shardOptions, handler)
 }
 
 func ChainOpFilters(filters ...OpFilter) OpFilter {
@@ -470,6 +552,9 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 		}
 		if err = iter.Close(); err != nil {
 			ctx.ErrC <- err
+			if err.Error() == "EOF" {
+				time.Sleep(1 * time.Minute)
+			}
 		}
 		if iter.Timeout() {
 			select {
@@ -721,6 +806,7 @@ func StartMulti(sessions []*mgo.Session, options *Options) *OpCtxMulti {
 	var resumeC = make(chan bool, 1)
 
 	ctxMulti := &OpCtxMulti{
+		lock:         &sync.Mutex{},
 		OpC:          opC,
 		ErrC:         errC,
 		DirectReadWg: &directReadWg,
@@ -731,9 +817,12 @@ func StartMulti(sessions []*mgo.Session, options *Options) *OpCtxMulti {
 		seekC:        seekC,
 	}
 
+	ctxMulti.lock.Lock()
+	defer ctxMulti.lock.Unlock()
+
 	for _, session := range sessions {
 		ctx := Start(session, options)
-		ctxMulti.Contexts = append(ctxMulti.Contexts, ctx)
+		ctxMulti.contexts = append(ctxMulti.contexts, ctx)
 		go func() {
 			directReadWg.Add(1)
 			defer directReadWg.Done()
