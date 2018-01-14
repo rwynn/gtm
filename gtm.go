@@ -29,6 +29,7 @@ const (
 type Options struct {
 	After               TimestampGenerator
 	Filter              OpFilter
+	NamespaceFilter     OpFilter
 	OpLogDatabaseName   *string
 	OpLogCollectionName *string
 	CursorTimeout       *string
@@ -248,7 +249,7 @@ func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardIn
 func (ctx *OpCtxMulti) AddShardListener(
 	configSession *mgo.Session, shardOptions *Options, handler ShardInsertHandler) {
 	opts := DefaultOptions()
-	opts.Filter = func(op *Op) bool {
+	opts.NamespaceFilter = func(op *Op) bool {
 		return op.Namespace == "config.shards" && op.IsInsert()
 	}
 	configCtx := Start(configSession, opts)
@@ -407,39 +408,59 @@ func UpdateIsReplace(entry map[string]interface{}) bool {
 	}
 }
 
+func (this *Op) shouldParse() bool {
+	return this.IsInsert() || this.IsDelete() || this.IsUpdate() || this.IsCommand()
+}
+
+func (this *Op) matchesNsFilter(options *Options) bool {
+	return options.NamespaceFilter == nil || options.NamespaceFilter(this)
+}
+
+func (this *Op) matchesFilter(options *Options) bool {
+	return options.Filter == nil || options.Filter(this)
+}
+
+func (this *Op) matchesDirectFilter(options *Options) bool {
+	return options.DirectReadFilter == nil || options.DirectReadFilter(this)
+}
+
 func (this *Op) ParseLogEntry(entry *OpLog, options *Options) (include bool) {
 	var rawField *bson.Raw
 	var objectField map[string]interface{}
 	this.Operation = entry.Operation
 	this.Timestamp = entry.Timestamp
 	this.Namespace = entry.Namespace
-	if this.IsInsert() || this.IsDelete() || this.IsUpdate() {
-		if this.IsUpdate() {
-			rawField = entry.Update
-			rawField.Unmarshal(&objectField)
-		} else {
+	if this.shouldParse() {
+		if this.IsCommand() {
 			rawField = entry.Doc
 			rawField.Unmarshal(&objectField)
-		}
-		this.Id = objectField["_id"]
-		if this.IsInsert() {
 			this.Data = objectField
-		} else if this.IsUpdate() {
-			var changeField map[string]interface{}
-			rawField = entry.Doc
-			rawField.Unmarshal(&changeField)
-			if options.UpdateDataAsDelta || UpdateIsReplace(changeField) {
-				this.Data = changeField
+		}
+		if this.matchesNsFilter(options) {
+			if this.IsInsert() || this.IsDelete() || this.IsUpdate() {
+				if this.IsUpdate() {
+					rawField = entry.Update
+					rawField.Unmarshal(&objectField)
+				} else {
+					rawField = entry.Doc
+					rawField.Unmarshal(&objectField)
+				}
+				this.Id = objectField["_id"]
+				if this.IsInsert() {
+					this.Data = objectField
+				} else if this.IsUpdate() {
+					var changeField map[string]interface{}
+					rawField = entry.Doc
+					rawField.Unmarshal(&changeField)
+					if options.UpdateDataAsDelta || UpdateIsReplace(changeField) {
+						this.Data = changeField
+					}
+				}
+				include = true
+			} else if this.IsCommand() {
+				include = this.IsDrop()
 			}
 		}
-		include = true
-	} else if this.IsCommand() {
-		rawField = entry.Doc
-		rawField.Unmarshal(&objectField)
-		this.Data = objectField
-		include = this.IsDrop()
-	} else {
-		include = false
 	}
 	return
 }
@@ -518,7 +539,7 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 				Source:    OplogQuerySource,
 			}
 			if op.ParseLogEntry(&entry, options) {
-				if options.Filter == nil || options.Filter(op) {
+				if op.matchesFilter(options) {
 					if options.UpdateDataAsDelta {
 						ctx.OpC <- op
 					} else {
@@ -618,7 +639,7 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 				t := op.Id.(bson.ObjectId).Time().UTC().Unix()
 				op.Timestamp = bson.MongoTimestamp(t << 32)
 			}
-			if options.DirectReadFilter == nil || options.DirectReadFilter(op) {
+			if op.matchesDirectFilter(options) {
 				ctx.OpC <- op
 			}
 			result = make(map[string]interface{})
@@ -700,6 +721,7 @@ func DefaultOptions() *Options {
 	return &Options{
 		After:               nil,
 		Filter:              nil,
+		NamespaceFilter:     nil,
 		OpLogDatabaseName:   nil,
 		OpLogCollectionName: nil,
 		CursorTimeout:       nil,

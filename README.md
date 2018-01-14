@@ -69,10 +69,12 @@ It can be used to send emails to new users, [index documents](https://www.github
 	// if you want to listen only for certain events on certain collections
 	// pass a filter function in options
 	ctx := gtm.Start(session, &gtm.Options{
-		Filter:              NewUsers, 	   // only receive inserts in the user collection
+		NamespaceFilter: NewUsers, // only receive inserts in the user collection
 	})
 	// more options are available for tuning
 	ctx := gtm.Start(session, &gtm.Options{
+        NamespaceFilter      nil,           // op filter function that has access to type/ns ONLY
+        Filter               nil,           // op filter function that has access to type/ns/data
 		After:               nil,     	    // if nil defaults to LastOpTimestamp
 		OpLogDatabaseName:   nil,     	    // defaults to "local"
 		OpLogCollectionName: nil,     	    // defaults to a collection prefixed "oplog."
@@ -103,7 +105,7 @@ You can wait till all the collections have been fully read by using the DirectRe
 
 gtm has support for sharded MongoDB clusters.  You will want to start with a connection to the MongoDBconfig server to get the list of available shards.
 
-    // assuming the config server for a sharded cluster is running locally on port 27018
+    // assuming the CONFIG server for a sharded cluster is running locally on port 27018
     configSession, err = mgo.Dial("127.0.0.1:27018")
     if err != nil {
         panic(err)
@@ -152,7 +154,9 @@ Create a TOML document containing a list of all the event handlers.
 
 	Workers = [ "Tom", "Dick", "Harry" ] 
 
-Create a consistent filter to distribute the work between Tom, Dick, and Harry.
+Create a consistent filter to distribute the work between Tom, Dick, and Harry. A consistent filter
+needs to acces the Data attribute of each op so it needs to be set as a Filter as opposed to a 
+NamespaceFilter.
 	
 	name := flag.String("name", "", "the name of this worker")
 	flag.Parse()
@@ -169,6 +173,6 @@ Pass the filter into the options when calling gtm.Tail
 
 	ctx := gtm.Start(session, &gtm.Options{Filter: filter})
 
-(Optional) If you have your own filter you can use the gtm utility method ChainOpFilters
+If you have your multiple filters you can use the gtm utility method ChainOpFilters
 	
 	func ChainOpFilters(filters ...OpFilter) OpFilter
