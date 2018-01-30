@@ -681,7 +681,6 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 		default:
 			continue
 		}
-
 	}
 	return
 }
