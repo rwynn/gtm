@@ -646,18 +646,14 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 		}
 		result := make(map[string]interface{})
 		for iter.Next(&result) {
+			t := time.Now().UTC().Unix()
 			op := &Op{
 				Id:        result["_id"],
 				Operation: "i",
 				Namespace: ns,
 				Data:      result,
 				Source:    DirectQuerySource,
-			}
-			switch op.Id.(type) {
-			case bson.ObjectId:
-				// set timestamp based on id
-				t := op.Id.(bson.ObjectId).Time().UTC().Unix()
-				op.Timestamp = bson.MongoTimestamp(t << 32)
+				Timestamp: bson.MongoTimestamp(t << 32),
 			}
 			if op.matchesDirectFilter(options) {
 				ctx.OpC <- op
