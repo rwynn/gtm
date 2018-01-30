@@ -4,9 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"github.com/BurntSushi/toml"
+	"github.com/globalsign/mgo/bson"
 	"github.com/rwynn/gtm"
 	"github.com/serialx/hashring"
-	"gopkg.in/mgo.v2/bson"
 )
 
 type ConfigOptions struct {

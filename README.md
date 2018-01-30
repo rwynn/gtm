@@ -6,7 +6,7 @@ It can be used to send emails to new users, [index documents](https://www.github
 
 ### Requirements ###
 + [Go](http://golang.org/doc/install)
-+ [mgo](http://labix.org/mgo), the mongodb driver for Go
++ [globalsign/mgo](https://godoc.org/github.com/globalsign/mgo), a mongodb driver for Go
 + [mongodb](http://www.mongodb.org/)
 	+ Pass argument --master to mongod to ensure an oplog is created OR
 	+ Setup [replica sets](http://docs.mongodb.org/manual/tutorial/deploy-replica-set/) to create oplog
@@ -19,8 +19,8 @@ It can be used to send emails to new users, [index documents](https://www.github
 	
 	package main
 	
-	import "gopkg.in/mgo.v2"
-	import "gopkg.in/mgo.v2/bson"
+	import "github.com/globalsign/mgo"
+	import "github.com/globalsign/mgo/bson"
 	import "github.com/rwynn/gtm"
 	import "fmt"
 

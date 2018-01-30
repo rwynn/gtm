@@ -2,9 +2,10 @@ package gtm
 
 import (
 	"fmt"
+	"github.com/globalsign/mgo"
+	"github.com/globalsign/mgo/bson"
 	"github.com/serialx/hashring"
-	"gopkg.in/mgo.v2"
-	"gopkg.in/mgo.v2/bson"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +37,7 @@ type Options struct {
 	ChannelSize         int
 	BufferSize          int
 	BufferDuration      time.Duration
+	EOFDuration         time.Duration
 	Ordering            OrderingGuarantee
 	WorkerCount         int
 	UpdateDataAsDelta   bool
@@ -573,8 +575,16 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 		}
 		if err = iter.Close(); err != nil {
 			ctx.ErrC <- err
-			if err.Error() == "EOF" {
-				time.Sleep(1 * time.Minute)
+			if err == io.EOF {
+				time.Sleep(options.EOFDuration)
+				select {
+				case <-ctx.stopC:
+					return nil
+				default:
+					s.Refresh()
+					iter = GetOpLogQuery(s, currTimestamp, options).Tail(duration)
+					continue
+				}
 			}
 		}
 		if iter.Timeout() {
@@ -621,6 +631,16 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 		if iter.Done() {
 			if err = iter.Close(); err != nil {
 				ctx.ErrC <- err
+				if err == io.EOF {
+					time.Sleep(options.EOFDuration)
+					select {
+					case <-ctx.stopC:
+						return
+					default:
+						s.Refresh()
+						continue
+					}
+				}
 			}
 			break
 		}
@@ -646,6 +666,16 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 		}
 		if err = iter.Close(); err != nil {
 			ctx.ErrC <- err
+			if err == io.EOF {
+				time.Sleep(options.EOFDuration)
+				select {
+				case <-ctx.stopC:
+					return
+				default:
+					s.Refresh()
+					continue
+				}
+			}
 			break
 		}
 		skip = skip + (limit * options.DirectReadersPerCol)
@@ -728,6 +758,7 @@ func DefaultOptions() *Options {
 		ChannelSize:         512,
 		BufferSize:          50,
 		BufferDuration:      time.Duration(750) * time.Millisecond,
+		EOFDuration:         time.Duration(20) * time.Second,
 		Ordering:            Oplog,
 		WorkerCount:         1,
 		UpdateDataAsDelta:   false,
@@ -786,6 +817,9 @@ func (this *Options) SetDefaults() {
 	}
 	if this.DirectReadBatchSize < 1 {
 		this.DirectReadBatchSize = defaultOpts.DirectReadBatchSize
+	}
+	if this.EOFDuration == 0 {
+		this.EOFDuration = defaultOpts.EOFDuration
 	}
 }
 
