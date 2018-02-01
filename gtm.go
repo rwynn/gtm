@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/globalsign/mgo"
 	"github.com/globalsign/mgo/bson"
+	"github.com/pkg/errors"
 	"github.com/serialx/hashring"
 	"io"
 	"strconv"
@@ -85,6 +86,7 @@ type OpBuf struct {
 }
 
 type OpCtx struct {
+	lock         *sync.Mutex
 	OpC          OpChan
 	ErrC         chan error
 	DirectReadWg *sync.WaitGroup
@@ -95,6 +97,7 @@ type OpCtx struct {
 	pauseC       chan bool
 	resumeC      chan bool
 	paused       bool
+	stopped      bool
 }
 
 type OpCtxMulti struct {
@@ -109,6 +112,14 @@ type OpCtxMulti struct {
 	pauseC       chan bool
 	resumeC      chan bool
 	paused       bool
+	stopped      bool
+}
+
+func IsConnectionError(err error) (is bool) {
+	if err != nil {
+		is = (err.Error() == "no reachable servers" || err == io.EOF || err == io.ErrClosedPipe || err == io.ErrNoProgress || err == io.ErrUnexpectedEOF)
+	}
+	return
 }
 
 type ShardInfo struct {
@@ -124,11 +135,40 @@ func (shard *ShardInfo) GetURL() string {
 	}
 }
 
+func (ctx *OpCtx) waitForConnection(wg *sync.WaitGroup, session *mgo.Session, options *Options) {
+	defer wg.Done()
+	var ok bool
+	for !ok {
+		select {
+		case <-ctx.stopC:
+			return
+		default:
+			s := session.Copy()
+			if err := s.Ping(); err == nil {
+				ok = true
+			} else {
+				time.Sleep(options.EOFDuration)
+			}
+			s.Close()
+		}
+	}
+}
+
+func (ctx *OpCtx) isStopped() bool {
+	ctx.lock.Lock()
+	defer ctx.lock.Unlock()
+	return ctx.stopped
+}
+
 func (ctx *OpCtx) Since(ts bson.MongoTimestamp) {
+	ctx.lock.Lock()
+	defer ctx.lock.Unlock()
 	ctx.seekC <- ts
 }
 
 func (ctx *OpCtx) Pause() {
+	ctx.lock.Lock()
+	defer ctx.lock.Unlock()
 	if !ctx.paused {
 		ctx.paused = true
 		ctx.pauseC <- true
@@ -136,6 +176,8 @@ func (ctx *OpCtx) Pause() {
 }
 
 func (ctx *OpCtx) Resume() {
+	ctx.lock.Lock()
+	defer ctx.lock.Unlock()
 	if ctx.paused {
 		ctx.paused = false
 		ctx.resumeC <- true
@@ -143,10 +185,15 @@ func (ctx *OpCtx) Resume() {
 }
 
 func (ctx *OpCtx) Stop() {
-	for i := 1; i <= ctx.routines; i++ {
-		ctx.stopC <- true
+	ctx.lock.Lock()
+	defer ctx.lock.Unlock()
+	if !ctx.stopped {
+		ctx.stopped = true
+		for i := 1; i <= ctx.routines; i++ {
+			ctx.stopC <- true
+		}
+		ctx.allWg.Wait()
 	}
-	ctx.allWg.Wait()
 }
 
 func (ctx *OpCtxMulti) Since(ts bson.MongoTimestamp) {
@@ -184,11 +231,13 @@ func (ctx *OpCtxMulti) Resume() {
 func (ctx *OpCtxMulti) Stop() {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
-	ctx.stopC <- true
-	for _, child := range ctx.contexts {
-		go child.Stop()
+	if !ctx.stopped {
+		ctx.stopC <- true
+		for _, child := range ctx.contexts {
+			go child.Stop()
+		}
+		ctx.allWg.Wait()
 	}
-	ctx.allWg.Wait()
 }
 
 func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardInsertHandler) {
@@ -217,7 +266,7 @@ func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardIn
 			}
 			shardSession, err := handler(shardInfo)
 			if err != nil {
-				multi.ErrC <- err
+				multi.ErrC <- errors.Wrap(err, "Error calling shard handler")
 				continue
 			}
 			shardCtx := Start(shardSession, options)
@@ -352,7 +401,7 @@ func (this *OpBuf) IsFull() bool {
 	return len(this.Entries) >= this.BufferSize
 }
 
-func (this *OpBuf) Flush(session *mgo.Session, ctx *OpCtx) {
+func (this *OpBuf) Flush(session *mgo.Session, ctx *OpCtx, options *Options) {
 	if len(this.Entries) == 0 {
 		return
 	}
@@ -390,7 +439,20 @@ func (this *OpBuf) Flush(session *mgo.Session, ctx *OpCtx) {
 				}
 			}
 		} else {
-			ctx.ErrC <- err
+			if IsConnectionError(err) {
+				ctx.ErrC <- errors.Wrap(err, "Connection to MongoDB lost while finding documents to associate with ops")
+				var wg sync.WaitGroup
+				wg.Add(1)
+				go ctx.waitForConnection(&wg, session, options)
+				wg.Wait()
+				if ctx.isStopped() {
+					this.Entries = nil
+					return
+				}
+				session.Refresh()
+			} else {
+				ctx.ErrC <- errors.Wrap(err, "Error finding documents to associate with ops")
+			}
 		}
 	}
 	for _, op := range this.Entries {
@@ -574,17 +636,20 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 			}
 		}
 		if err = iter.Close(); err != nil {
-			ctx.ErrC <- err
-			if err == io.EOF {
-				time.Sleep(options.EOFDuration)
-				select {
-				case <-ctx.stopC:
+			if IsConnectionError(err) {
+				ctx.ErrC <- errors.Wrap(err, "Connection to MongoDB lost while tailing oplog entries")
+				var wg sync.WaitGroup
+				wg.Add(1)
+				go ctx.waitForConnection(&wg, session, options)
+				wg.Wait()
+				if ctx.isStopped() {
 					return nil
-				default:
-					s.Refresh()
-					iter = GetOpLogQuery(s, currTimestamp, options).Tail(duration)
-					continue
 				}
+				s.Refresh()
+				iter = GetOpLogQuery(s, currTimestamp, options).Tail(duration)
+				continue
+			} else {
+				ctx.ErrC <- errors.Wrap(err, "Error tailing oplog entries")
 			}
 		}
 		if iter.Timeout() {
@@ -619,7 +684,7 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 	dbCol := strings.SplitN(ns, ".", 2)
 	if len(dbCol) != 2 {
 		err = fmt.Errorf("Invalid direct read ns: %s :expecting db.collection", ns)
-		ctx.ErrC <- err
+		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads")
 		return
 	}
 	db, col := dbCol[0], dbCol[1]
@@ -630,16 +695,19 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 		iter := q.Iter()
 		if iter.Done() {
 			if err = iter.Close(); err != nil {
-				ctx.ErrC <- err
-				if err == io.EOF {
-					time.Sleep(options.EOFDuration)
-					select {
-					case <-ctx.stopC:
-						return
-					default:
-						s.Refresh()
-						continue
+				if IsConnectionError(err) {
+					ctx.ErrC <- errors.Wrap(err, "Connection to MongoDB lost while performing direct reads of collections")
+					var wg sync.WaitGroup
+					wg.Add(1)
+					go ctx.waitForConnection(&wg, session, options)
+					wg.Wait()
+					if ctx.isStopped() {
+						return nil
 					}
+					s.Refresh()
+					continue
+				} else {
+					ctx.ErrC <- errors.Wrap(err, "Error performing direct reads of collections")
 				}
 			}
 			break
@@ -661,16 +729,19 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 			result = make(map[string]interface{})
 		}
 		if err = iter.Close(); err != nil {
-			ctx.ErrC <- err
-			if err == io.EOF {
-				time.Sleep(options.EOFDuration)
-				select {
-				case <-ctx.stopC:
-					return
-				default:
-					s.Refresh()
-					continue
+			if IsConnectionError(err) {
+				ctx.ErrC <- errors.Wrap(err, "Connection to MongoDB lost while performing direct reads of collections")
+				var wg sync.WaitGroup
+				wg.Add(1)
+				go ctx.waitForConnection(&wg, session, options)
+				wg.Wait()
+				if ctx.isStopped() {
+					return nil
 				}
+				s.Refresh()
+				continue
+			} else {
+				ctx.ErrC <- errors.Wrap(err, "Error performing direct reads of collections")
 			}
 			break
 		}
@@ -685,7 +756,7 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 	return
 }
 
-func FetchDocuments(ctx *OpCtx, session *mgo.Session, filter OpFilter, buf *OpBuf, inOp OpChan) error {
+func FetchDocuments(ctx *OpCtx, session *mgo.Session, filter OpFilter, buf *OpBuf, inOp OpChan, options *Options) error {
 	defer ctx.allWg.Done()
 	s := session.Copy()
 	defer s.Close()
@@ -694,12 +765,12 @@ func FetchDocuments(ctx *OpCtx, session *mgo.Session, filter OpFilter, buf *OpBu
 		case <-ctx.stopC:
 			return nil
 		case <-buf.FlushTicker.C:
-			buf.Flush(s, ctx)
+			buf.Flush(s, ctx, options)
 		case op := <-inOp:
 			if filter(op) {
 				buf.Append(op)
 				if buf.IsFull() {
-					buf.Flush(s, ctx)
+					buf.Flush(s, ctx, options)
 					buf.FlushTicker.Stop()
 					buf.FlushTicker = time.NewTicker(buf.BufferDuration)
 				}
@@ -753,7 +824,7 @@ func DefaultOptions() *Options {
 		ChannelSize:         512,
 		BufferSize:          50,
 		BufferDuration:      time.Duration(750) * time.Millisecond,
-		EOFDuration:         time.Duration(20) * time.Second,
+		EOFDuration:         time.Duration(5) * time.Second,
 		Ordering:            Oplog,
 		WorkerCount:         1,
 		UpdateDataAsDelta:   false,
@@ -919,6 +990,7 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 	var resumeC = make(chan bool, 1)
 
 	ctx := &OpCtx{
+		lock:         &sync.Mutex{},
 		OpC:          opC,
 		ErrC:         errC,
 		DirectReadWg: &directReadWg,
@@ -945,7 +1017,7 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 		}
 		worker := strconv.Itoa(i)
 		filter := OpFilterForOrdering(options.Ordering, workerNames, worker)
-		go FetchDocuments(ctx, session, filter, buf, inOp)
+		go FetchDocuments(ctx, session, filter, buf, inOp, options)
 	}
 
 	for _, ns := range options.DirectReadNs {
