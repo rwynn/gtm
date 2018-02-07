@@ -414,6 +414,7 @@ func (this *OpBuf) Flush(session *mgo.Session, ctx *OpCtx, options *Options) {
 			byId[idKey] = append(byId[idKey], op)
 		}
 	}
+Retry:
 	for n, opIds := range ns {
 		var parts = strings.SplitN(n, ".", 2)
 		var results []map[string]interface{}
@@ -450,6 +451,7 @@ func (this *OpBuf) Flush(session *mgo.Session, ctx *OpCtx, options *Options) {
 					return
 				}
 				session.Refresh()
+				break Retry
 			} else {
 				ctx.ErrC <- errors.Wrap(err, "Error finding documents to associate with ops")
 			}
@@ -468,7 +470,6 @@ func UpdateIsReplace(entry map[string]interface{}) bool {
 		return false
 	} else {
 		return true
-
 	}
 }
 
