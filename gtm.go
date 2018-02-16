@@ -6,7 +6,6 @@ import (
 	"github.com/globalsign/mgo/bson"
 	"github.com/pkg/errors"
 	"github.com/serialx/hashring"
-	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -115,13 +114,6 @@ type OpCtxMulti struct {
 	stopped      bool
 }
 
-func IsConnectionError(err error) (is bool) {
-	if err != nil {
-		is = (err.Error() == "no reachable servers" || err == io.EOF || err == io.ErrClosedPipe || err == io.ErrNoProgress || err == io.ErrUnexpectedEOF)
-	}
-	return
-}
-
 type ShardInfo struct {
 	hostname string
 }
@@ -137,17 +129,17 @@ func (shard *ShardInfo) GetURL() string {
 
 func (ctx *OpCtx) waitForConnection(wg *sync.WaitGroup, session *mgo.Session, options *Options) {
 	defer wg.Done()
-	var ok bool
-	for !ok {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for {
 		select {
 		case <-ctx.stopC:
 			return
-		default:
+		case <-t.C:
 			s := session.Copy()
 			if err := s.Ping(); err == nil {
-				ok = true
-			} else {
-				time.Sleep(options.EOFDuration)
+				s.Close()
+				return
 			}
 			s.Close()
 		}
@@ -440,21 +432,17 @@ Retry:
 				}
 			}
 		} else {
-			if IsConnectionError(err) {
-				ctx.ErrC <- errors.Wrap(err, "Connection to MongoDB lost while finding documents to associate with ops")
-				var wg sync.WaitGroup
-				wg.Add(1)
-				go ctx.waitForConnection(&wg, session, options)
-				wg.Wait()
-				if ctx.isStopped() {
-					this.Entries = nil
-					return
-				}
-				session.Refresh()
-				break Retry
-			} else {
-				ctx.ErrC <- errors.Wrap(err, "Error finding documents to associate with ops")
+			ctx.ErrC <- errors.Wrap(err, "Error finding documents to associate with ops")
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go ctx.waitForConnection(&wg, session, options)
+			wg.Wait()
+			if ctx.isStopped() {
+				this.Entries = nil
+				return
 			}
+			session.Refresh()
+			break Retry
 		}
 	}
 	for _, op := range this.Entries {
@@ -637,21 +625,17 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 			}
 		}
 		if err = iter.Close(); err != nil {
-			if IsConnectionError(err) {
-				ctx.ErrC <- errors.Wrap(err, "Connection to MongoDB lost while tailing oplog entries")
-				var wg sync.WaitGroup
-				wg.Add(1)
-				go ctx.waitForConnection(&wg, session, options)
-				wg.Wait()
-				if ctx.isStopped() {
-					return nil
-				}
-				s.Refresh()
-				iter = GetOpLogQuery(s, currTimestamp, options).Tail(duration)
-				continue
-			} else {
-				ctx.ErrC <- errors.Wrap(err, "Error tailing oplog entries")
+			ctx.ErrC <- errors.Wrap(err, "Error tailing oplog entries")
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go ctx.waitForConnection(&wg, session, options)
+			wg.Wait()
+			if ctx.isStopped() {
+				return nil
 			}
+			s.Refresh()
+			iter = GetOpLogQuery(s, currTimestamp, options).Tail(duration)
+			continue
 		}
 		if iter.Timeout() {
 			select {
@@ -696,20 +680,16 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 		iter := q.Iter()
 		if iter.Done() {
 			if err = iter.Close(); err != nil {
-				if IsConnectionError(err) {
-					ctx.ErrC <- errors.Wrap(err, "Connection to MongoDB lost while performing direct reads of collections")
-					var wg sync.WaitGroup
-					wg.Add(1)
-					go ctx.waitForConnection(&wg, session, options)
-					wg.Wait()
-					if ctx.isStopped() {
-						return nil
-					}
-					s.Refresh()
-					continue
-				} else {
-					ctx.ErrC <- errors.Wrap(err, "Error performing direct reads of collections")
+				ctx.ErrC <- errors.Wrap(err, "Error performing direct reads of collections")
+				var wg sync.WaitGroup
+				wg.Add(1)
+				go ctx.waitForConnection(&wg, session, options)
+				wg.Wait()
+				if ctx.isStopped() {
+					return nil
 				}
+				s.Refresh()
+				continue
 			}
 			break
 		}
@@ -730,21 +710,16 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 			result = make(map[string]interface{})
 		}
 		if err = iter.Close(); err != nil {
-			if IsConnectionError(err) {
-				ctx.ErrC <- errors.Wrap(err, "Connection to MongoDB lost while performing direct reads of collections")
-				var wg sync.WaitGroup
-				wg.Add(1)
-				go ctx.waitForConnection(&wg, session, options)
-				wg.Wait()
-				if ctx.isStopped() {
-					return nil
-				}
-				s.Refresh()
-				continue
-			} else {
-				ctx.ErrC <- errors.Wrap(err, "Error performing direct reads of collections")
+			ctx.ErrC <- errors.Wrap(err, "Error performing direct reads of collections")
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go ctx.waitForConnection(&wg, session, options)
+			wg.Wait()
+			if ctx.isStopped() {
+				return nil
 			}
-			break
+			s.Refresh()
+			continue
 		}
 		skip = skip + (limit * options.DirectReadersPerCol)
 		select {
