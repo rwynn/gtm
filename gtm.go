@@ -262,13 +262,13 @@ func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardIn
 			shardCtx := Start(shardSession, options)
 			multi.lock.Lock()
 			multi.contexts = append(multi.contexts, shardCtx)
+			multi.DirectReadWg.Add(1)
 			go func() {
-				multi.DirectReadWg.Add(1)
 				defer multi.DirectReadWg.Done()
 				shardCtx.DirectReadWg.Wait()
 			}()
+			multi.allWg.Add(1)
 			go func() {
-				multi.allWg.Add(1)
 				defer multi.allWg.Done()
 				shardCtx.allWg.Wait()
 			}()
