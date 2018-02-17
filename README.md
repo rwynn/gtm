@@ -86,7 +86,6 @@ It can be used to send emails to new users, [index documents](https://www.github
 		Ordering:            gtm.Document,  // defaults to gtm.Oplog. ordering guarantee of events on the output channel
 		UpdateDataAsDelta:   false,         // set to true to only receive delta information in the Data field on updates (info straight from oplog)
 		DirectReadNs: []string{"db.users"}, // set to a slice of namespaces to read data directly from bypassing the oplog
-		DirectReadLimit:     200,           // defaults to 100. the maximum number of documents to return in each direct read query
 	})
 
 ### Direct Reads ###

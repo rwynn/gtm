@@ -42,8 +42,6 @@ type Options struct {
 	WorkerCount         int
 	UpdateDataAsDelta   bool
 	DirectReadNs        []string
-	DirectReadersPerCol int
-	DirectReadLimit     int
 	DirectReadFilter    OpFilter
 	DirectReadBatchSize int
 }
@@ -660,12 +658,11 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 	return nil
 }
 
-func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *Options) (err error) {
+func DirectRead(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (err error) {
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
 	s := session.Copy()
 	defer s.Close()
-	skip, limit := idx*options.DirectReadLimit, options.DirectReadLimit
 	dbCol := strings.SplitN(ns, ".", 2)
 	if len(dbCol) != 2 {
 		err = fmt.Errorf("Invalid direct read ns: %s :expecting db.collection", ns)
@@ -674,27 +671,15 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 	}
 	db, col := dbCol[0], dbCol[1]
 	c := s.DB(db).C(col)
-	q := c.Find(nil).Limit(limit).Sort("_id").Hint("_id").Batch(options.DirectReadBatchSize)
+	var sel bson.M = nil
 	for {
-		q.Skip(skip)
+		foundResults := false
+		q := c.Find(sel).Sort("_id").Hint("_id").Batch(options.DirectReadBatchSize)
 		iter := q.Iter()
-		if iter.Done() {
-			if err = iter.Close(); err != nil {
-				ctx.ErrC <- errors.Wrap(err, "Error performing direct reads of collections")
-				var wg sync.WaitGroup
-				wg.Add(1)
-				go ctx.waitForConnection(&wg, session, options)
-				wg.Wait()
-				if ctx.isStopped() {
-					return nil
-				}
-				s.Refresh()
-				continue
-			}
-			break
-		}
 		result := make(map[string]interface{})
 		for iter.Next(&result) {
+			foundResults = true
+			sel = bson.M{"_id": bson.M{"$gt": result["_id"]}}
 			t := time.Now().UTC().Unix()
 			op := &Op{
 				Id:        result["_id"],
@@ -708,6 +693,12 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 				ctx.OpC <- op
 			}
 			result = make(map[string]interface{})
+			select {
+			case <-ctx.stopC:
+				return
+			default:
+				continue
+			}
 		}
 		if err = iter.Close(); err != nil {
 			ctx.ErrC <- errors.Wrap(err, "Error performing direct reads of collections")
@@ -720,13 +711,8 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, idx int, ns string, options *O
 			}
 			s.Refresh()
 			continue
-		}
-		skip = skip + (limit * options.DirectReadersPerCol)
-		select {
-		case <-ctx.stopC:
-			return
-		default:
-			continue
+		} else if !foundResults {
+			break
 		}
 	}
 	return
@@ -805,8 +791,6 @@ func DefaultOptions() *Options {
 		WorkerCount:         1,
 		UpdateDataAsDelta:   false,
 		DirectReadNs:        []string{},
-		DirectReadLimit:     5000,
-		DirectReadersPerCol: 10,
 		DirectReadFilter:    nil,
 		DirectReadBatchSize: 500,
 	}
@@ -850,12 +834,6 @@ func (this *Options) SetDefaults() {
 	if this.UpdateDataAsDelta {
 		this.Ordering = Oplog
 		this.WorkerCount = 0
-	}
-	if this.DirectReadLimit == 0 {
-		this.DirectReadLimit = defaultOpts.DirectReadLimit
-	}
-	if this.DirectReadersPerCol == 0 {
-		this.DirectReadersPerCol = defaultOpts.DirectReadersPerCol
 	}
 	if this.DirectReadBatchSize < 1 {
 		this.DirectReadBatchSize = defaultOpts.DirectReadBatchSize
@@ -921,13 +899,13 @@ func StartMulti(sessions []*mgo.Session, options *Options) *OpCtxMulti {
 	for _, session := range sessions {
 		ctx := Start(session, options)
 		ctxMulti.contexts = append(ctxMulti.contexts, ctx)
+		directReadWg.Add(1)
 		go func() {
-			directReadWg.Add(1)
 			defer directReadWg.Done()
 			ctx.DirectReadWg.Wait()
 		}()
+		allWg.Add(1)
 		go func() {
-			allWg.Add(1)
 			defer allWg.Done()
 			ctx.allWg.Wait()
 		}()
@@ -952,7 +930,7 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 		options.SetDefaults()
 	}
 
-	routines := options.WorkerCount + (len(options.DirectReadNs) * options.DirectReadersPerCol) + 1
+	routines := options.WorkerCount + len(options.DirectReadNs) + 1
 	stopC := make(chan bool, routines)
 	errC := make(chan error, options.ChannelSize)
 	opC := make(OpChan, options.ChannelSize)
@@ -997,11 +975,9 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 	}
 
 	for _, ns := range options.DirectReadNs {
-		for i := 0; i < options.DirectReadersPerCol; i++ {
-			directReadWg.Add(1)
-			allWg.Add(1)
-			go DirectRead(ctx, session, i, ns, options)
-		}
+		directReadWg.Add(1)
+		allWg.Add(1)
+		go DirectRead(ctx, session, ns, options)
 	}
 
 	allWg.Add(1)
