@@ -44,15 +44,17 @@ type Options struct {
 	DirectReadNs        []string
 	DirectReadFilter    OpFilter
 	DirectReadBatchSize int
+	Unmarshal           DataUnmarshaller
 }
 
 type Op struct {
 	Id        interface{}            `json:"_id"`
 	Operation string                 `json:"operation"`
 	Namespace string                 `json:"namespace"`
-	Data      map[string]interface{} `json:"data"`
+	Data      map[string]interface{} `json:"data,omitempty"`
 	Timestamp bson.MongoTimestamp    `json:"timestamp"`
 	Source    QuerySource            `json:"source"`
+	Doc       interface{}            `json:"doc,omitempty"`
 }
 
 type OpLog struct {
@@ -65,6 +67,10 @@ type OpLog struct {
 	Update       *bson.Raw           "o2"
 }
 
+type Doc struct {
+	Id interface{} "_id"
+}
+
 type OpChan chan *Op
 
 type OpLogEntry map[string]interface{}
@@ -74,6 +80,8 @@ type OpFilter func(*Op) bool
 type ShardInsertHandler func(*ShardInfo) (*mgo.Session, error)
 
 type TimestampGenerator func(*mgo.Session, *Options) bson.MongoTimestamp
+
+type DataUnmarshaller func(namespace string, raw *bson.Raw) (interface{}, error)
 
 type OpBuf struct {
 	Entries        []*Op
@@ -398,7 +406,7 @@ func (this *OpBuf) Flush(session *mgo.Session, ctx *OpCtx, options *Options) {
 	ns := make(map[string][]interface{})
 	byId := make(map[interface{}][]*Op)
 	for _, op := range this.Entries {
-		if op.IsUpdate() && op.Data == nil {
+		if op.IsUpdate() && op.Doc == nil {
 			idKey := fmt.Sprintf("%s.%v", op.Namespace, op.Id)
 			ns[op.Namespace] = append(ns[op.Namespace], op.Id)
 			byId[idKey] = append(byId[idKey], op)
@@ -407,24 +415,22 @@ func (this *OpBuf) Flush(session *mgo.Session, ctx *OpCtx, options *Options) {
 Retry:
 	for n, opIds := range ns {
 		var parts = strings.SplitN(n, ".", 2)
-		var results []map[string]interface{}
+		var results []*bson.Raw
 		db, col := parts[0], parts[1]
 		sel := bson.M{"_id": bson.M{"$in": opIds}}
 		collection := session.DB(db).C(col)
 		err := collection.Find(sel).All(&results)
 		if err == nil {
 			for _, result := range results {
-				resultId := fmt.Sprintf("%s.%v", n, result["_id"])
+				var doc Doc
+				result.Unmarshal(&doc)
+				resultId := fmt.Sprintf("%s.%v", n, doc.Id)
 				if ops, ok := byId[resultId]; ok {
-					if len(ops) == 1 {
-						ops[0].Data = result
-					} else {
-						for _, o := range ops {
-							data := make(map[string]interface{})
-							for k, v := range result {
-								data[k] = v
-							}
-							o.Data = data
+					for _, o := range ops {
+						if u, err := options.Unmarshal(o.Namespace, result); err == nil {
+							o.processData(u)
+						} else {
+							ctx.ErrC <- err
 						}
 					}
 				}
@@ -475,36 +481,50 @@ func (this *Op) matchesDirectFilter(options *Options) bool {
 	return options.DirectReadFilter == nil || options.DirectReadFilter(this)
 }
 
-func (this *Op) ParseLogEntry(entry *OpLog, options *Options) (include bool) {
+func (this *Op) processData(data interface{}) {
+	if data != nil {
+		this.Doc = data
+		if m, ok := data.(map[string]interface{}); ok {
+			this.Data = m
+		}
+	}
+}
+
+func (this *Op) ParseLogEntry(entry *OpLog, options *Options) (include bool, err error) {
 	var rawField *bson.Raw
-	var objectField map[string]interface{}
+	var u interface{}
 	this.Operation = entry.Operation
 	this.Timestamp = entry.Timestamp
 	this.Namespace = entry.Namespace
 	if this.shouldParse() {
 		if this.IsCommand() {
+			var objectField map[string]interface{}
 			rawField = entry.Doc
-			rawField.Unmarshal(&objectField)
-			this.Data = objectField
+			err = rawField.Unmarshal(&objectField)
+			this.processData(objectField)
 		}
 		if this.matchesNsFilter(options) {
 			if this.IsInsert() || this.IsDelete() || this.IsUpdate() {
 				if this.IsUpdate() {
 					rawField = entry.Update
-					rawField.Unmarshal(&objectField)
 				} else {
 					rawField = entry.Doc
-					rawField.Unmarshal(&objectField)
 				}
-				this.Id = objectField["_id"]
+				var doc Doc
+				rawField.Unmarshal(&doc)
+				this.Id = doc.Id
 				if this.IsInsert() {
-					this.Data = objectField
+					if u, err = options.Unmarshal(this.Namespace, rawField); err == nil {
+						this.processData(u)
+					}
 				} else if this.IsUpdate() {
 					var changeField map[string]interface{}
 					rawField = entry.Doc
 					rawField.Unmarshal(&changeField)
 					if options.UpdateDataAsDelta || UpdateIsReplace(changeField) {
-						this.Data = changeField
+						if u, err = options.Unmarshal(this.Namespace, rawField); err == nil {
+							this.processData(u)
+						}
 					}
 				}
 				include = true
@@ -589,8 +609,9 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 				Timestamp: bson.MongoTimestamp(0),
 				Source:    OplogQuerySource,
 			}
-			if op.ParseLogEntry(&entry, options) {
-				if op.matchesFilter(options) {
+			ok, err := op.ParseLogEntry(&entry, options)
+			if err == nil {
+				if ok && op.matchesFilter(options) {
 					if options.UpdateDataAsDelta {
 						ctx.OpC <- op
 					} else {
@@ -600,6 +621,8 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 						}
 					}
 				}
+			} else {
+				ctx.ErrC <- err
 			}
 			select {
 			case <-ctx.stopC:
@@ -676,23 +699,29 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (
 		foundResults := false
 		q := c.Find(sel).Sort("_id").Hint("_id").Batch(options.DirectReadBatchSize)
 		iter := q.Iter()
-		result := make(map[string]interface{})
-		for iter.Next(&result) {
+		var result = &bson.Raw{}
+		for iter.Next(result) {
 			foundResults = true
-			sel = bson.M{"_id": bson.M{"$gt": result["_id"]}}
+			var doc Doc
+			result.Unmarshal(&doc)
+			sel = bson.M{"_id": bson.M{"$gt": doc.Id}}
 			t := time.Now().UTC().Unix()
 			op := &Op{
-				Id:        result["_id"],
+				Id:        doc.Id,
 				Operation: "i",
 				Namespace: ns,
-				Data:      result,
 				Source:    DirectQuerySource,
 				Timestamp: bson.MongoTimestamp(t << 32),
 			}
-			if op.matchesDirectFilter(options) {
-				ctx.OpC <- op
+			if u, err := options.Unmarshal(ns, result); err == nil {
+				op.processData(u)
+				if op.matchesDirectFilter(options) {
+					ctx.OpC <- op
+				}
+			} else {
+				ctx.ErrC <- err
 			}
-			result = make(map[string]interface{})
+			result = &bson.Raw{}
 			select {
 			case <-ctx.stopC:
 				return
@@ -793,6 +822,7 @@ func DefaultOptions() *Options {
 		DirectReadNs:        []string{},
 		DirectReadFilter:    nil,
 		DirectReadBatchSize: 500,
+		Unmarshal:           defaultUnmarshaller,
 	}
 }
 
@@ -811,6 +841,15 @@ func (this *Options) Fill(session *mgo.Session) {
 	if this.CursorTimeout == nil {
 		defaultCursorTimeout := "100s"
 		this.CursorTimeout = &defaultCursorTimeout
+	}
+}
+
+func defaultUnmarshaller(namespace string, raw *bson.Raw) (interface{}, error) {
+	var m map[string]interface{}
+	if err := raw.Unmarshal(&m); err == nil {
+		return m, nil
+	} else {
+		return nil, err
 	}
 }
 
@@ -840,6 +879,9 @@ func (this *Options) SetDefaults() {
 	}
 	if this.EOFDuration == 0 {
 		this.EOFDuration = defaultOpts.EOFDuration
+	}
+	if this.Unmarshal == nil {
+		this.Unmarshal = defaultOpts.Unmarshal
 	}
 }
 
