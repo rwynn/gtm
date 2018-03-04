@@ -142,9 +142,48 @@ you enter a loop to read events from the multi context.
         return mgo.Dial(shardURL)
 	}
 
-    multiCtx.AddShardListener(configSession, nil, insertHandler)
+	multiCtx.AddShardListener(configSession, nil, insertHandler)
 
 ### Advanced ###
+
+If you'd like to unmarshall MongoDB documents into your own struct instead of the document getting
+unmarshalled to a generic map[string]interface{} you can use the following branch:
+
+	https://github.com/rwynn/gtm/tree/feat/unmarshal
+
+With this branch you can setup your own unmarshalling function
+
+	type MyDoc struct {
+		Id interface{} "_id"
+		Foo string "foo"
+	}
+
+	func custom(namespace string, raw *bson.Raw) (interface{}, error) {
+		// use namespace, e.g. db.col, to map to a custom struct
+		if namespace == "test.test" {
+			var doc MyDoc
+			if err := raw.Unmarshal(&doc); err == nil {
+				return doc, nil
+			} else {
+				return nil, err
+			}
+		}
+		return nil, errors.New("unsupported namespace")
+	}
+	
+	ctx := gtm.Start(session, &gtm.Options{
+		Unmarshal: custom,
+	}
+
+	for {
+		select {
+		case op:= <-ctx.OpC:
+			if op.Namespace === "test.test" {
+				doc := ctx.Doc.(MyDoc)
+				fmt.Println(doc.Foo)
+			}
+		}
+	}
 
 You may want to distribute event handling between a set of worker processes on different machines.
 To do this you can leverage the **github.com/rwynn/gtm/consistent** package.  
