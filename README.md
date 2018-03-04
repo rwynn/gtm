@@ -175,7 +175,7 @@ unmarshalled to a generic map[string]interface{} you can use a custom unmarshal 
 		select {
 		case op:= <-ctx.OpC:
 			if op.Namespace == "test.test" {
-				doc := ctx.Doc.(MyDoc)
+				doc := op.Doc.(MyDoc)
 				fmt.Println(doc.Foo)
 			}
 		}
