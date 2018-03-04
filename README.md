@@ -179,7 +179,7 @@ With this branch you can setup your own unmarshalling function
 		select {
 		case op:= <-ctx.OpC:
 			if op.Namespace == "test.test" {
-				doc := ctx.Doc.(MyDoc)
+				doc := op.Doc.(MyDoc)
 				fmt.Println(doc.Foo)
 			}
 		}
