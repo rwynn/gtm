@@ -444,7 +444,9 @@ Retry:
 		}
 	}
 	for _, op := range this.Entries {
-		ctx.OpC <- op
+		if op.matchesFilter(options) {
+			ctx.OpC <- op
+		}
 	}
 	this.Entries = nil
 }
@@ -626,7 +628,7 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 			ctx.ErrC <- errors.Wrap(err, "Error tailing oplog entries")
 			var wg sync.WaitGroup
 			wg.Add(1)
-			go ctx.waitForConnection(&wg, session, options)
+			go ctx.waitForConnection(&wg, s, options)
 			wg.Wait()
 			if ctx.isStopped() {
 				return nil
@@ -704,7 +706,7 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (
 			ctx.ErrC <- errors.Wrap(err, "Error performing direct reads of collections")
 			var wg sync.WaitGroup
 			wg.Add(1)
-			go ctx.waitForConnection(&wg, session, options)
+			go ctx.waitForConnection(&wg, s, options)
 			wg.Wait()
 			if ctx.isStopped() {
 				return nil
