@@ -73,8 +73,8 @@ It can be used to send emails to new users, [index documents](https://www.github
 	})
 	// more options are available for tuning
 	ctx := gtm.Start(session, &gtm.Options{
-        NamespaceFilter      nil,           // op filter function that has access to type/ns ONLY
-        Filter               nil,           // op filter function that has access to type/ns/data
+                NamespaceFilter      nil,           // op filter function that has access to type/ns ONLY
+                Filter               nil,           // op filter function that has access to type/ns/data
 		After:               nil,     	    // if nil defaults to LastOpTimestamp
 		OpLogDatabaseName:   nil,     	    // defaults to "local"
 		OpLogCollectionName: nil,     	    // defaults to a collection prefixed "oplog."
@@ -86,6 +86,8 @@ It can be used to send emails to new users, [index documents](https://www.github
 		Ordering:            gtm.Document,  // defaults to gtm.Oplog. ordering guarantee of events on the output channel
 		UpdateDataAsDelta:   false,         // set to true to only receive delta information in the Data field on updates (info straight from oplog)
 		DirectReadNs: []string{"db.users"}, // set to a slice of namespaces to read data directly from bypassing the oplog
+	        DirectReadCursors:   10,            // determines the requested number of cursors to parallelCollectionScan
+		Log:                 myLogger,      // pass your own logger
 	})
 
 ### Direct Reads ###
@@ -144,7 +146,7 @@ you enter a loop to read events from the multi context.
 
 	multiCtx.AddShardListener(configSession, nil, insertHandler)
 
-### Advanced ###
+### Custom Unmarshalling ###
 
 If you'd like to unmarshall MongoDB documents into your own struct instead of the document getting
 unmarshalled to a generic map[string]interface{} you can use a custom unmarshal function:
@@ -181,6 +183,8 @@ unmarshalled to a generic map[string]interface{} you can use a custom unmarshal 
 		}
 	}
 
+### Workers ###
+
 You may want to distribute event handling between a set of worker processes on different machines.
 To do this you can leverage the **github.com/rwynn/gtm/consistent** package.  
 
@@ -210,3 +214,18 @@ Pass the filter into the options when calling gtm.Tail
 If you have your multiple filters you can use the gtm utility method ChainOpFilters
 	
 	func ChainOpFilters(filters ...OpFilter) OpFilter
+
+### Parallel Collection Scans ###
+
+Gtm will attempt to enable MongoDB's parallel collection scan feature for direct reads.  Currently when using the WiredTiger
+storage engine this will be disabled since WiredTiger only returns 1 cursor.  In the future, when WiredTiger is enhanced to 
+support more than 1 cursor on a parallel collection scan, Gtm should enable and use multiple cursors without an upgrade.  
+
+So, currently to get a massive speed up on direct reads one needs to use the mmapv1 storage engine which unfortunately is not the
+default.
+
+The number of cursors requested per collection is configurable via `DirectReadCursors`.  The number of cursors actually returned by
+MongoDB may be less than the requested amount.  
+
+For more information on see [Parallel Collection Scan](https://docs.mongodb.com/manual/reference/command/parallelCollectionScan/).
+
