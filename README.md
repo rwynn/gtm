@@ -147,11 +147,7 @@ you enter a loop to read events from the multi context.
 ### Advanced ###
 
 If you'd like to unmarshall MongoDB documents into your own struct instead of the document getting
-unmarshalled to a generic map[string]interface{} you can use the following branch:
-
-	https://github.com/rwynn/gtm/tree/feat/unmarshal
-
-With this branch you can setup your own unmarshalling function
+unmarshalled to a generic map[string]interface{} you can use a custom unmarshal function:
 
 	type MyDoc struct {
 		Id interface{} "_id"
