@@ -6,6 +6,8 @@ import (
 	"github.com/globalsign/mgo/bson"
 	"github.com/pkg/errors"
 	"github.com/serialx/hashring"
+	"log"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,6 +48,7 @@ type Options struct {
 	DirectReadBatchSize int
 	DirectReadCursors   int
 	Unmarshal           DataUnmarshaller
+	Log                 *log.Logger
 }
 
 type Op struct {
@@ -124,6 +127,7 @@ type OpCtx struct {
 	resumeC      chan bool
 	paused       bool
 	stopped      bool
+	log          *log.Logger
 }
 
 type OpCtxMulti struct {
@@ -139,6 +143,7 @@ type OpCtxMulti struct {
 	resumeC      chan bool
 	paused       bool
 	stopped      bool
+	log          *log.Logger
 }
 
 type ShardInfo struct {
@@ -170,14 +175,15 @@ func (b *BuildInfo) build() {
 	}
 }
 
-func (n *N) parse(ns string) error {
+func (n *N) parse(ns string) (err error) {
 	parts := strings.SplitN(ns, ".", 2)
 	if len(parts) != 2 {
-		return fmt.Errorf("Invalid ns: %s :expecting db.collection", ns)
+		err = fmt.Errorf("Invalid ns: %s :expecting db.collection", ns)
+	} else {
+		n.database = parts[0]
+		n.collection = parts[1]
 	}
-	n.database = parts[0]
-	n.collection = parts[1]
-	return nil
+	return
 }
 
 func (shard *ShardInfo) GetURL() string {
@@ -767,7 +773,7 @@ func DirectReadCollectionScan(ctx *OpCtx, session *mgo.Session, ns string, optio
 	if err != nil {
 		msg := fmt.Sprintf("Parallel collection scan of %s failed", ns)
 		ctx.ErrC <- errors.Wrap(err, msg)
-		// revert to a single threaded read
+		ctx.log.Println("Reverting to single-threaded collection read")
 		ctx.allWg.Add(1)
 		ctx.DirectReadWg.Add(1)
 		go DirectRead(ctx, session, ns, options)
@@ -780,7 +786,8 @@ func DirectReadCollectionScan(ctx *OpCtx, session *mgo.Session, ns string, optio
 			go DirectReadCursor(ctx, session, ns, options, cursor.Info)
 		}
 	} else {
-		// revert to a single threaded read
+		ctx.log.Println("Only 1 cursor available for collection scan in this storage engine")
+		ctx.log.Println("Reverting to single-threaded collection read")
 		ctx.allWg.Add(1)
 		ctx.DirectReadWg.Add(1)
 		go DirectRead(ctx, session, ns, options)
@@ -982,6 +989,7 @@ func DefaultOptions() *Options {
 		DirectReadBatchSize: 500,
 		DirectReadCursors:   10,
 		Unmarshal:           defaultUnmarshaller,
+		Log:                 log.New(os.Stdout, "INFO ", log.Flags()),
 	}
 }
 
@@ -1045,6 +1053,9 @@ func (this *Options) SetDefaults() {
 	if this.Unmarshal == nil {
 		this.Unmarshal = defaultOpts.Unmarshal
 	}
+	if this.Log == nil {
+		this.Log = defaultOpts.Log
+	}
 }
 
 func Tail(session *mgo.Session, options *Options) (OpChan, chan error) {
@@ -1105,6 +1116,7 @@ func StartMulti(sessions []*mgo.Session, options *Options) *OpCtxMulti {
 		pauseC:       pauseC,
 		resumeC:      resumeC,
 		seekC:        seekC,
+		log:          options.Log,
 	}
 
 	ctxMulti.lock.Lock()
@@ -1166,6 +1178,7 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 		pauseC:       pauseC,
 		resumeC:      resumeC,
 		seekC:        seekC,
+		log:          options.Log,
 	}
 
 	for i := 1; i <= options.WorkerCount; i++ {
@@ -1186,9 +1199,16 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 		go FetchDocuments(ctx, session, filter, buf, inOp, options)
 	}
 
-	scanOk, err := SupportsCollectionScan(session)
-	if err != nil {
-		ctx.ErrC <- errors.Wrap(err, "Error determining collection scan support")
+	var scanOk bool
+	var err error
+	if len(options.DirectReadNs) > 0 {
+		scanOk, err = SupportsCollectionScan(session)
+		if err != nil {
+			ctx.ErrC <- errors.Wrap(err, "Error determining collection scan support")
+		}
+		if scanOk {
+			ctx.log.Println("Direct read parallel collection scan is ON")
+		}
 	}
 
 	for _, ns := range options.DirectReadNs {
