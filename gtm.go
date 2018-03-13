@@ -769,8 +769,10 @@ func DirectReadCollectionScan(ctx *OpCtx, session *mgo.Session, ns string, optio
 		Numcursors: options.DirectReadCursors,
 	}
 	var result PCollectionScanResult
-	err = session.DB(n.database).Run(scan, &result)
+	s := session.Copy()
+	err = s.DB(n.database).Run(scan, &result)
 	if err != nil || result.Ok == 0 {
+		defer s.Close()
 		msg := fmt.Sprintf("Parallel collection scan of %s failed", ns)
 		ctx.ErrC <- errors.Wrap(err, msg)
 		ctx.log.Println("Reverting to single-threaded collection read")
@@ -783,9 +785,10 @@ func DirectReadCollectionScan(ctx *OpCtx, session *mgo.Session, ns string, optio
 		for _, cursor := range result.Cursors {
 			ctx.allWg.Add(1)
 			ctx.DirectReadWg.Add(1)
-			go DirectReadCursor(ctx, session, ns, options, cursor.Info)
+			go DirectReadCursor(ctx, s, ns, options, cursor.Info)
 		}
 	} else {
+		defer s.Close()
 		ctx.log.Println("Only 1 cursor available for collection scan in this storage engine")
 		ctx.log.Println("Reverting to single-threaded collection read")
 		ctx.allWg.Add(1)
