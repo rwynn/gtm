@@ -450,7 +450,9 @@ Retry:
 		}
 	}
 	for _, op := range this.Entries {
-		ctx.OpC <- op
+		if op.matchesFilter(options) {
+			ctx.OpC <- op
+		}
 	}
 	this.Entries = nil
 }
