@@ -44,6 +44,7 @@ type Options struct {
 	DirectReadNs        []string
 	DirectReadFilter    OpFilter
 	DirectReadBatchSize int
+	DirectReadCursors   int
 	Unmarshal           DataUnmarshaller
 }
 
@@ -65,6 +66,27 @@ type OpLog struct {
 	Namespace    string              "ns"
 	Doc          *bson.Raw           "o"
 	Update       *bson.Raw           "o2"
+}
+
+type CursorInfo struct {
+	Firstbatch []bson.Raw "firstBatch"
+	Namespace  string     "ns"
+	Id         int64      "id"
+}
+
+type Cursor struct {
+	Info CursorInfo "cursor"
+	Ok   string     "ok"
+}
+
+type PCollectionScanResult struct {
+	Cursors []Cursor "cursors"
+	Ok      string   "ok"
+}
+
+type PCollectionScan struct {
+	Namespace  string "parallelCollectionScan"
+	Numcursors int    "numCursors"
 }
 
 type Doc struct {
@@ -95,7 +117,6 @@ type OpCtx struct {
 	OpC          OpChan
 	ErrC         chan error
 	DirectReadWg *sync.WaitGroup
-	routines     int
 	stopC        chan bool
 	allWg        *sync.WaitGroup
 	seekC        chan bson.MongoTimestamp
@@ -222,9 +243,7 @@ func (ctx *OpCtx) Stop() {
 	defer ctx.lock.Unlock()
 	if !ctx.stopped {
 		ctx.stopped = true
-		for i := 1; i <= ctx.routines; i++ {
-			ctx.stopC <- true
-		}
+		close(ctx.stopC)
 		ctx.allWg.Wait()
 	}
 }
@@ -265,7 +284,8 @@ func (ctx *OpCtxMulti) Stop() {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
 	if !ctx.stopped {
-		ctx.stopC <- true
+		ctx.stopped = true
+		close(ctx.stopC)
 		for _, child := range ctx.contexts {
 			go child.Stop()
 		}
@@ -718,6 +738,109 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 	return nil
 }
 
+func SupportsCollectionScan(session *mgo.Session) (supports bool, err error) {
+	var buildInfo *BuildInfo
+	if buildInfo, err = VersionInfo(session); err == nil {
+		if buildInfo.major > 2 {
+			supports = true
+		} else if buildInfo.major == 2 && buildInfo.minor >= 6 {
+			supports = true
+		}
+	}
+	return
+}
+
+func DirectReadCollectionScan(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (err error) {
+	defer ctx.allWg.Done()
+	defer ctx.DirectReadWg.Done()
+	n := &N{}
+	if err = n.parse(ns); err != nil {
+		ctx.ErrC <- errors.Wrap(err, "Error parsing direct read namespace")
+		return
+	}
+	scan := PCollectionScan{
+		Namespace:  n.collection,
+		Numcursors: options.DirectReadCursors,
+	}
+	var result PCollectionScanResult
+	err = session.DB(n.database).Run(scan, &result)
+	if err != nil {
+		msg := fmt.Sprintf("Parallel collection scan of %s failed", ns)
+		ctx.ErrC <- errors.Wrap(err, msg)
+		// revert to a single threaded read
+		ctx.allWg.Add(1)
+		ctx.DirectReadWg.Add(1)
+		go DirectRead(ctx, session, ns, options)
+		return
+	}
+	if len(result.Cursors) > 1 {
+		for _, cursor := range result.Cursors {
+			ctx.allWg.Add(1)
+			ctx.DirectReadWg.Add(1)
+			go DirectReadCursor(ctx, session, ns, options, cursor.Info)
+		}
+	} else {
+		// revert to a single threaded read
+		ctx.allWg.Add(1)
+		ctx.DirectReadWg.Add(1)
+		go DirectRead(ctx, session, ns, options)
+	}
+	return
+}
+
+func DirectReadCursor(ctx *OpCtx, s *mgo.Session, ns string, options *Options, cursor CursorInfo) (err error) {
+	defer ctx.allWg.Done()
+	defer ctx.DirectReadWg.Done()
+	n := &N{}
+	if err = n.parse(ns); err != nil {
+		ctx.ErrC <- errors.Wrap(err, "Error parsing direct read namespace")
+		return
+	}
+	c := s.DB(n.database).C(n.collection)
+	iter := c.NewIter(nil, cursor.Firstbatch, cursor.Id, nil)
+	for {
+		foundResults := false
+		result := make(map[string]interface{})
+		for iter.Next(&result) {
+			foundResults = true
+			t := time.Now().UTC().Unix()
+			op := &Op{
+				Id:        result["_id"],
+				Operation: "i",
+				Namespace: ns,
+				Data:      result,
+				Source:    DirectQuerySource,
+				Timestamp: bson.MongoTimestamp(t << 32),
+			}
+			if op.matchesDirectFilter(options) {
+				ctx.OpC <- op
+			}
+			result = make(map[string]interface{})
+			select {
+			case <-ctx.stopC:
+				return
+			default:
+				continue
+			}
+		}
+		if err = iter.Close(); err != nil {
+			ctx.ErrC <- errors.Wrap(err, "Error performing direct reads of collections")
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go ctx.waitForConnection(&wg, s, options)
+			wg.Wait()
+			if ctx.isStopped() {
+				return
+			}
+			s.Refresh()
+			continue
+		} else if !foundResults {
+			break
+		}
+	}
+	return
+}
+
 func DirectRead(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (err error) {
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
@@ -725,7 +848,7 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (
 	defer s.Close()
 	n := &N{}
 	if err = n.parse(ns); err != nil {
-		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads")
+		ctx.ErrC <- errors.Wrap(err, "Error parsing direct read namespace")
 		return
 	}
 	c := s.DB(n.database).C(n.collection)
@@ -771,7 +894,7 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (
 			go ctx.waitForConnection(&wg, s, options)
 			wg.Wait()
 			if ctx.isStopped() {
-				return nil
+				return
 			}
 			s.Refresh()
 			continue
@@ -857,6 +980,7 @@ func DefaultOptions() *Options {
 		DirectReadNs:        []string{},
 		DirectReadFilter:    nil,
 		DirectReadBatchSize: 500,
+		DirectReadCursors:   10,
 		Unmarshal:           defaultUnmarshaller,
 	}
 }
@@ -911,6 +1035,9 @@ func (this *Options) SetDefaults() {
 	}
 	if this.DirectReadBatchSize < 1 {
 		this.DirectReadBatchSize = defaultOpts.DirectReadBatchSize
+	}
+	if this.DirectReadCursors < 1 {
+		this.DirectReadCursors = defaultOpts.DirectReadCursors
 	}
 	if this.EOFDuration == 0 {
 		this.EOFDuration = defaultOpts.EOFDuration
@@ -1017,8 +1144,7 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 		options.SetDefaults()
 	}
 
-	routines := options.WorkerCount + len(options.DirectReadNs) + 1
-	stopC := make(chan bool, routines)
+	stopC := make(chan bool)
 	errC := make(chan error, options.ChannelSize)
 	opC := make(OpChan, options.ChannelSize)
 
@@ -1035,7 +1161,6 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 		OpC:          opC,
 		ErrC:         errC,
 		DirectReadWg: &directReadWg,
-		routines:     routines,
 		stopC:        stopC,
 		allWg:        &allWg,
 		pauseC:       pauseC,
@@ -1061,10 +1186,19 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 		go FetchDocuments(ctx, session, filter, buf, inOp, options)
 	}
 
+	scanOk, err := SupportsCollectionScan(session)
+	if err != nil {
+		ctx.ErrC <- errors.Wrap(err, "Error determining collection scan support")
+	}
+
 	for _, ns := range options.DirectReadNs {
 		directReadWg.Add(1)
 		allWg.Add(1)
-		go DirectRead(ctx, session, ns, options)
+		if scanOk {
+			go DirectReadCollectionScan(ctx, session, ns, options)
+		} else {
+			go DirectRead(ctx, session, ns, options)
+		}
 	}
 
 	allWg.Add(1)
