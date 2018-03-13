@@ -807,22 +807,28 @@ func DirectReadCursor(ctx *OpCtx, s *mgo.Session, ns string, options *Options, c
 	iter := c.NewIter(nil, cursor.Firstbatch, cursor.Id, nil)
 	for {
 		foundResults := false
-		result := make(map[string]interface{})
-		for iter.Next(&result) {
+		var result = &bson.Raw{}
+		for iter.Next(result) {
 			foundResults = true
 			t := time.Now().UTC().Unix()
+			var doc Doc
+			result.Unmarshal(&doc)
 			op := &Op{
-				Id:        result["_id"],
+				Id:        doc.Id,
 				Operation: "i",
 				Namespace: ns,
-				Data:      result,
 				Source:    DirectQuerySource,
 				Timestamp: bson.MongoTimestamp(t << 32),
 			}
-			if op.matchesDirectFilter(options) {
-				ctx.OpC <- op
+			if u, err := options.Unmarshal(ns, result); err == nil {
+				op.processData(u)
+				if op.matchesDirectFilter(options) {
+					ctx.OpC <- op
+				}
+			} else {
+				ctx.ErrC <- err
 			}
-			result = make(map[string]interface{})
+			result = &bson.Raw{}
 			select {
 			case <-ctx.stopC:
 				return
