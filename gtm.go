@@ -116,6 +116,41 @@ type ShardInfo struct {
 	hostname string
 }
 
+type BuildInfo struct {
+	version []int
+	major   int
+	minor   int
+	patch   int
+}
+
+type N struct {
+	database   string
+	collection string
+}
+
+func (b *BuildInfo) build() {
+	parts := len(b.version)
+	if parts > 0 {
+		b.major = b.version[0]
+	}
+	if parts > 1 {
+		b.minor = b.version[1]
+	}
+	if parts > 2 {
+		b.patch = b.version[2]
+	}
+}
+
+func (n *N) parse(ns string) error {
+	parts := strings.SplitN(ns, ".", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("Invalid ns: %s :expecting db.collection", ns)
+	}
+	n.database = parts[0]
+	n.collection = parts[1]
+	return nil
+}
+
 func (shard *ShardInfo) GetURL() string {
 	hostParts := strings.SplitN(shard.hostname, "/", 2)
 	if len(hostParts) == 2 {
@@ -665,14 +700,12 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (
 	defer ctx.DirectReadWg.Done()
 	s := session.Copy()
 	defer s.Close()
-	dbCol := strings.SplitN(ns, ".", 2)
-	if len(dbCol) != 2 {
-		err = fmt.Errorf("Invalid direct read ns: %s :expecting db.collection", ns)
+	n := &N{}
+	if err = n.parse(ns); err != nil {
 		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads")
 		return
 	}
-	db, col := dbCol[0], dbCol[1]
-	c := s.DB(db).C(col)
+	c := s.DB(n.database).C(n.collection)
 	var sel bson.M = nil
 	for {
 		foundResults := false
@@ -862,6 +895,16 @@ func GetShards(session *mgo.Session) (shardInfos []*ShardInfo) {
 			hostname: host,
 		}
 		shardInfos = append(shardInfos, shardInfo)
+	}
+	return
+}
+
+func VersionInfo(session *mgo.Session) (buildInfo *BuildInfo, err error) {
+	if info, err := session.BuildInfo(); err == nil {
+		buildInfo = &BuildInfo{
+			version: info.VersionArray,
+		}
+		buildInfo.build()
 	}
 	return
 }
