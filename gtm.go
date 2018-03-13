@@ -79,12 +79,12 @@ type CursorInfo struct {
 
 type Cursor struct {
 	Info CursorInfo "cursor"
-	Ok   string     "ok"
+	Ok   bool       "ok"
 }
 
 type PCollectionScanResult struct {
 	Cursors []Cursor "cursors"
-	Ok      string   "ok"
+	Ok      int      "ok"
 }
 
 type PCollectionScan struct {
@@ -770,7 +770,7 @@ func DirectReadCollectionScan(ctx *OpCtx, session *mgo.Session, ns string, optio
 	}
 	var result PCollectionScanResult
 	err = session.DB(n.database).Run(scan, &result)
-	if err != nil {
+	if err != nil || result.Ok == 0 {
 		msg := fmt.Sprintf("Parallel collection scan of %s failed", ns)
 		ctx.ErrC <- errors.Wrap(err, msg)
 		ctx.log.Println("Reverting to single-threaded collection read")
