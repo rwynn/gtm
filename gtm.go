@@ -789,7 +789,9 @@ func DirectReadCollectionScan(ctx *OpCtx, session *mgo.Session, ns string, optio
 		}
 	} else {
 		defer s.Close()
-		ctx.log.Println("Only 1 cursor available for collection scan in this storage engine")
+		if scan.Numcursors > 1 {
+			ctx.log.Println("Only 1 cursor available for collection scan in this storage engine")
+		}
 		ctx.log.Println("Reverting to single-threaded collection read")
 		ctx.allWg.Add(1)
 		ctx.DirectReadWg.Add(1)
