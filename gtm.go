@@ -769,10 +769,8 @@ func DirectReadCollectionScan(ctx *OpCtx, session *mgo.Session, ns string, optio
 		Numcursors: options.DirectReadCursors,
 	}
 	var result PCollectionScanResult
-	s := session.Copy()
-	err = s.DB(n.database).Run(scan, &result)
+	err = session.DB(n.database).Run(scan, &result)
 	if err != nil || result.Ok == 0 {
-		defer s.Close()
 		msg := fmt.Sprintf("Parallel collection scan of %s failed", ns)
 		ctx.ErrC <- errors.Wrap(err, msg)
 		ctx.log.Println("Reverting to single-threaded collection read")
@@ -781,14 +779,15 @@ func DirectReadCollectionScan(ctx *OpCtx, session *mgo.Session, ns string, optio
 		go DirectRead(ctx, session, ns, options)
 		return
 	}
+	ctx.log.Printf("Parallel collection scan command returned %d/%d cursors requested for %s", len(result.Cursors), scan.Numcursors, ns)
 	if len(result.Cursors) > 1 {
+		ctx.log.Printf("Starting %d go routines to read %s", len(result.Cursors), ns)
 		for _, cursor := range result.Cursors {
 			ctx.allWg.Add(1)
 			ctx.DirectReadWg.Add(1)
-			go DirectReadCursor(ctx, s, ns, options, cursor.Info)
+			go DirectReadCursor(ctx, session, ns, options, cursor.Info)
 		}
 	} else {
-		defer s.Close()
 		if scan.Numcursors > 1 {
 			ctx.log.Println("Only 1 cursor available for collection scan in this storage engine")
 		}
@@ -800,14 +799,17 @@ func DirectReadCollectionScan(ctx *OpCtx, session *mgo.Session, ns string, optio
 	return
 }
 
-func DirectReadCursor(ctx *OpCtx, s *mgo.Session, ns string, options *Options, cursor CursorInfo) (err error) {
+func DirectReadCursor(ctx *OpCtx, session *mgo.Session, ns string, options *Options, cursor CursorInfo) (err error) {
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
+	s := session.Copy() // we want this to be a new connection
+	defer s.Close()
 	n := &N{}
 	if err = n.parse(ns); err != nil {
 		ctx.ErrC <- errors.Wrap(err, "Error parsing direct read namespace")
 		return
 	}
+	s.Ping() // need to do this on the new connection for some reason before requesting NewIter?
 	c := s.DB(n.database).C(n.collection)
 	iter := c.NewIter(nil, cursor.Firstbatch, cursor.Id, nil)
 	for {
