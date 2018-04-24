@@ -39,14 +39,11 @@ type Options struct {
 	ChannelSize         int
 	BufferSize          int
 	BufferDuration      time.Duration
-	EOFDuration         time.Duration
 	Ordering            OrderingGuarantee
 	WorkerCount         int
 	UpdateDataAsDelta   bool
 	DirectReadNs        []string
 	DirectReadFilter    OpFilter
-	DirectReadBatchSize int
-	DirectReadCursors   int
 	Unmarshal           DataUnmarshaller
 	Log                 *log.Logger
 }
@@ -71,29 +68,111 @@ type OpLog struct {
 	Update       *bson.Raw           "o2"
 }
 
-type CursorInfo struct {
-	Firstbatch []bson.Raw "firstBatch"
-	Namespace  string     "ns"
-	Id         int64      "id"
+type SplitVectorResult struct {
+	SplitKeys []bson.M "splitKeys"
+	Ok        int      "ok"
 }
 
-type Cursor struct {
-	Info CursorInfo "cursor"
-	Ok   bool       "ok"
-}
-
-type PCollectionScanResult struct {
-	Cursors []Cursor "cursors"
-	Ok      int      "ok"
-}
-
-type PCollectionScan struct {
-	Namespace  string "parallelCollectionScan"
-	Numcursors int    "numCursors"
+type SplitVectorRequest struct {
+	SplitVector    string      "splitVector"
+	KeyPattern     bson.M      "keyPattern"
+	Min            interface{} "min"
+	Max            interface{} "max"
+	MaxChunkSize   int         "maxChunkSize"
+	MaxSplitPoints int         "maxSplitPoints"
+	Force          bool        "force"
 }
 
 type Doc struct {
 	Id interface{} "_id"
+}
+
+type CollectionSegment struct {
+	min         interface{}
+	max         interface{}
+	splitKey    string
+	splits      []bson.M
+	subSegments []*CollectionSegment
+}
+
+func (cs *CollectionSegment) shrinkTo(next interface{}) {
+	cs.max = next
+}
+
+func (cs *CollectionSegment) toIDSelector() bson.M {
+	sel := bson.M{}
+	if cs.max != nil {
+		sel[cs.splitKey] = bson.M{
+			"$gte": cs.min,
+			"$lt":  cs.max,
+		}
+	} else {
+		sel[cs.splitKey] = bson.M{
+			"$gte": cs.min,
+		}
+	}
+	return sel
+}
+
+func (cs *CollectionSegment) toSelector() bson.M {
+	if cs.splitKey == "_id" {
+		return cs.toIDSelector()
+	} else {
+		sel := bson.M{}
+		if cs.max != nil {
+			sel[cs.splitKey] = bson.M{
+				"$gte": cs.min,
+				"$lt":  cs.max,
+			}
+		} else {
+			sel[cs.splitKey] = bson.M{
+				"$gte": cs.min,
+			}
+		}
+		return sel
+	}
+}
+
+func (cs *CollectionSegment) divide() {
+	if len(cs.splits) == 0 {
+		return
+	}
+	ns := &CollectionSegment{
+		splitKey: cs.splitKey,
+		min:      cs.min,
+		max:      cs.max,
+	}
+	cs.subSegments = nil
+	for _, split := range cs.splits {
+		ns.shrinkTo(split[cs.splitKey])
+		cs.subSegments = append(cs.subSegments, ns)
+		ns = &CollectionSegment{
+			splitKey: cs.splitKey,
+			min:      ns.max,
+			max:      cs.max,
+		}
+	}
+	ns = &CollectionSegment{
+		splitKey: cs.splitKey,
+		min:      cs.splits[len(cs.splits)-1][cs.splitKey],
+	}
+	cs.subSegments = append(cs.subSegments, ns)
+}
+
+func (cs *CollectionSegment) init(c *mgo.Collection) (err error) {
+	doc := bson.M{}
+	var q *mgo.Query
+	q = c.Find(nil).Sort(cs.splitKey).Limit(1)
+	if err = q.One(&doc); err != nil {
+		return
+	}
+	cs.min = doc[cs.splitKey]
+	q = c.Find(nil).Sort("-" + cs.splitKey).Limit(1)
+	if err = q.One(&doc); err != nil {
+		return
+	}
+	cs.max = doc[cs.splitKey]
+	return
 }
 
 type OpChan chan *Op
@@ -652,6 +731,7 @@ func GetOpLogQuery(session *mgo.Session, after bson.MongoTimestamp, options *Opt
 func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Options) error {
 	defer ctx.allWg.Done()
 	s := session.Copy()
+	s.SetMode(mgo.Eventual, true)
 	defer s.Close()
 	options.Fill(s)
 	duration, err := time.ParseDuration(*options.CursorTimeout)
@@ -744,119 +824,161 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 	return nil
 }
 
-func SupportsCollectionScan(session *mgo.Session) (supports bool, err error) {
-	var buildInfo *BuildInfo
-	if buildInfo, err = VersionInfo(session); err == nil {
-		if buildInfo.major > 2 {
-			supports = true
-		} else if buildInfo.major == 2 && buildInfo.minor >= 6 {
-			supports = true
-		}
-	}
-	return
-}
-
-func DirectReadCollectionScan(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (err error) {
+func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (err error) {
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
+	doSimpleRead := func() {
+		ctx.allWg.Add(1)
+		ctx.DirectReadWg.Add(1)
+		go DirectRead(ctx, session, ns, options)
+	}
 	n := &N{}
 	if err = n.parse(ns); err != nil {
 		ctx.ErrC <- errors.Wrap(err, "Error parsing direct read namespace")
 		return
 	}
-	scan := PCollectionScan{
-		Namespace:  n.collection,
-		Numcursors: options.DirectReadCursors,
-	}
-	var result PCollectionScanResult
-	err = session.DB(n.database).Run(scan, &result)
-	if err != nil || result.Ok == 0 {
-		msg := fmt.Sprintf("Parallel collection scan of %s failed", ns)
+	col := session.DB(n.database).C(n.collection)
+	indexes, err := col.Indexes()
+	if err != nil {
+		msg := fmt.Sprintf("Unable to determine indexes on %s for direct read split vector", ns)
 		ctx.ErrC <- errors.Wrap(err, msg)
-		ctx.log.Println("Reverting to single-threaded collection read")
-		ctx.allWg.Add(1)
-		ctx.DirectReadWg.Add(1)
-		go DirectRead(ctx, session, ns, options)
+		doSimpleRead()
 		return
 	}
-	ctx.log.Printf("Parallel collection scan command returned %d/%d cursors requested for %s", len(result.Cursors), scan.Numcursors, ns)
-	if len(result.Cursors) > 1 {
-		ctx.log.Printf("Starting %d go routines to read %s", len(result.Cursors), ns)
-		for _, cursor := range result.Cursors {
+	var splitMax int
+	bestSplit := &CollectionSegment{
+		splitKey: "_id",
+	}
+	for _, index := range indexes {
+		key := strings.TrimPrefix(index.Key[0], "-")
+		if key != "_id" {
+			cseg := &CollectionSegment{
+				splitKey: key,
+			}
+			err = cseg.init(col)
+			if err == nil {
+				dir := 1
+				if strings.HasPrefix(index.Key[0], "-") {
+					dir = -1
+				}
+				splitv := SplitVectorRequest{
+					SplitVector:    ns,
+					KeyPattern:     bson.M{cseg.splitKey: dir},
+					Min:            cseg.min,
+					Max:            cseg.max,
+					MaxChunkSize:   20,
+					MaxSplitPoints: 24,
+				}
+				var result SplitVectorResult
+				err = session.Run(splitv, &result)
+				if err != nil || result.Ok == 0 {
+					msg := fmt.Sprintf("Split Vector admin command failed for key pattern %s in namespace %s. This admin command is used to split a collection for concurrent reads", ns, key)
+					ctx.ErrC <- errors.Wrap(err, msg)
+					continue
+				}
+				if len(result.SplitKeys) > splitMax {
+					splitMax = len(result.SplitKeys)
+					bestSplit = cseg
+					bestSplit.splits = result.SplitKeys
+				}
+			} else {
+				msg := fmt.Sprintf("Unable to check index bounds for namespace %s using key pattern %s", ns, key)
+				ctx.ErrC <- errors.Wrap(err, msg)
+			}
+		}
+	}
+	if bestSplit.splitKey == "_id" {
+		ctx.log.Printf("Unable to find a good split vector for namespace %s. Considering indexing a field that splits the collection for better performance.  Forcing 1 split on _id.", ns)
+		bestSplit.init(col)
+		splitv := SplitVectorRequest{
+			SplitVector:    ns,
+			KeyPattern:     bson.M{bestSplit.splitKey: 1},
+			Min:            bestSplit.min,
+			Max:            bestSplit.max,
+			MaxSplitPoints: 24,
+			Force:          true,
+		}
+		var result SplitVectorResult
+		err = session.Run(splitv, &result)
+		if err != nil || result.Ok == 0 {
+			msg := fmt.Sprintf("Split Vector admin command failed for namespace %s. This command is used to split a collection for concurrent reads", ns)
+			ctx.ErrC <- errors.Wrap(err, msg)
+			doSimpleRead()
+			return
+		}
+		bestSplit.splits = result.SplitKeys
+	} else {
+		ctx.log.Printf("Found %d splits (%d segments) for namespace %s using index on %s", splitMax, splitMax+1, ns, bestSplit.splitKey)
+	}
+	bestSplit.divide()
+	if len(bestSplit.subSegments) > 0 {
+		for _, subseg := range bestSplit.subSegments {
 			ctx.allWg.Add(1)
 			ctx.DirectReadWg.Add(1)
-			go DirectReadCursor(ctx, session, ns, options, cursor.Info)
+			go DirectReadSegment(ctx, session, ns, options, subseg)
 		}
 	} else {
-		if scan.Numcursors > 1 {
-			ctx.log.Println("Only 1 cursor available for collection scan in this storage engine")
-		}
-		ctx.log.Println("Reverting to single-threaded collection read")
-		ctx.allWg.Add(1)
-		ctx.DirectReadWg.Add(1)
-		go DirectRead(ctx, session, ns, options)
+		doSimpleRead()
 	}
 	return
 }
 
-func DirectReadCursor(ctx *OpCtx, session *mgo.Session, ns string, options *Options, cursor CursorInfo) (err error) {
+func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Options, seg *CollectionSegment) (err error) {
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
-	s := session.Copy() // we want this to be a new connection
+	s := session.Copy()
+	s.SetMode(mgo.Eventual, true)
 	defer s.Close()
 	n := &N{}
 	if err = n.parse(ns); err != nil {
 		ctx.ErrC <- errors.Wrap(err, "Error parsing direct read namespace")
 		return
 	}
-	s.Ping() // need to do this on the new connection for some reason before requesting NewIter?
 	c := s.DB(n.database).C(n.collection)
-	iter := c.NewIter(nil, cursor.Firstbatch, cursor.Id, nil)
-	for {
-		foundResults := false
-		var result = &bson.Raw{}
-		for iter.Next(result) {
-			foundResults = true
-			t := time.Now().UTC().Unix()
-			var doc Doc
-			result.Unmarshal(&doc)
-			op := &Op{
-				Id:        doc.Id,
-				Operation: "i",
-				Namespace: ns,
-				Source:    DirectQuerySource,
-				Timestamp: bson.MongoTimestamp(t << 32),
-			}
-			if u, err := options.Unmarshal(ns, result); err == nil {
-				op.processData(u)
-				if op.matchesDirectFilter(options) {
-					ctx.OpC <- op
-				}
-			} else {
-				ctx.ErrC <- err
-			}
-			result = &bson.Raw{}
-			select {
-			case <-ctx.stopC:
-				return
-			default:
-				continue
-			}
+	sel := seg.toSelector()
+	q := c.Find(sel)
+	iter := q.Iter()
+	var result = &bson.Raw{}
+	for iter.Next(&result) {
+		doc := bson.M{}
+		result.Unmarshal(&doc)
+		t := time.Now().UTC().Unix()
+		op := &Op{
+			Id:        doc["_id"],
+			Operation: "i",
+			Namespace: ns,
+			Source:    DirectQuerySource,
+			Timestamp: bson.MongoTimestamp(t << 32),
 		}
-		if err = iter.Close(); err != nil {
-			ctx.ErrC <- errors.Wrap(err, "Error performing direct reads of collections")
-			var wg sync.WaitGroup
-			wg.Add(1)
-			go ctx.waitForConnection(&wg, s, options)
-			wg.Wait()
-			if ctx.isStopped() {
-				return
+		if u, err := options.Unmarshal(ns, result); err == nil {
+			op.processData(u)
+			if op.matchesDirectFilter(options) {
+				ctx.OpC <- op
 			}
-			s.Refresh()
+		} else {
+			ctx.ErrC <- err
+		}
+		result = &bson.Raw{}
+		select {
+		case <-ctx.stopC:
+			iter.Close()
+			return
+		default:
 			continue
-		} else if !foundResults {
-			break
 		}
+	}
+	if err = iter.Close(); err != nil {
+		ctx.ErrC <- errors.Wrap(err, "Error performing direct reads of collections")
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go ctx.waitForConnection(&wg, s, options)
+		wg.Wait()
+		if ctx.isStopped() {
+			return
+		}
+		ctx.allWg.Add(1)
+		ctx.DirectReadWg.Add(1)
+		go DirectReadSegment(ctx, session, ns, options, seg)
 	}
 	return
 }
@@ -865,6 +987,7 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
 	s := session.Copy()
+	s.SetMode(mgo.Eventual, true)
 	defer s.Close()
 	n := &N{}
 	if err = n.parse(ns); err != nil {
@@ -872,55 +995,49 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (
 		return
 	}
 	c := s.DB(n.database).C(n.collection)
-	var sel bson.M = nil
-	for {
-		foundResults := false
-		q := c.Find(sel).Sort("_id").Hint("_id").Batch(options.DirectReadBatchSize)
-		iter := q.Iter()
-		var result = &bson.Raw{}
-		for iter.Next(result) {
-			foundResults = true
-			var doc Doc
-			result.Unmarshal(&doc)
-			sel = bson.M{"_id": bson.M{"$gt": doc.Id}}
-			t := time.Now().UTC().Unix()
-			op := &Op{
-				Id:        doc.Id,
-				Operation: "i",
-				Namespace: ns,
-				Source:    DirectQuerySource,
-				Timestamp: bson.MongoTimestamp(t << 32),
-			}
-			if u, err := options.Unmarshal(ns, result); err == nil {
-				op.processData(u)
-				if op.matchesDirectFilter(options) {
-					ctx.OpC <- op
-				}
-			} else {
-				ctx.ErrC <- err
-			}
-			result = &bson.Raw{}
-			select {
-			case <-ctx.stopC:
-				return
-			default:
-				continue
-			}
+	q := c.Find(nil)
+	iter := q.Iter()
+	var result = &bson.Raw{}
+	for iter.Next(result) {
+		var doc Doc
+		result.Unmarshal(&doc)
+		t := time.Now().UTC().Unix()
+		op := &Op{
+			Id:        doc.Id,
+			Operation: "i",
+			Namespace: ns,
+			Source:    DirectQuerySource,
+			Timestamp: bson.MongoTimestamp(t << 32),
 		}
-		if err = iter.Close(); err != nil {
-			ctx.ErrC <- errors.Wrap(err, "Error performing direct reads of collections")
-			var wg sync.WaitGroup
-			wg.Add(1)
-			go ctx.waitForConnection(&wg, s, options)
-			wg.Wait()
-			if ctx.isStopped() {
-				return
+		if u, err := options.Unmarshal(ns, result); err == nil {
+			op.processData(u)
+			if op.matchesDirectFilter(options) {
+				ctx.OpC <- op
 			}
-			s.Refresh()
+		} else {
+			ctx.ErrC <- err
+		}
+		result = &bson.Raw{}
+		select {
+		case <-ctx.stopC:
+			iter.Close()
+			return
+		default:
 			continue
-		} else if !foundResults {
-			break
 		}
+	}
+	if err = iter.Close(); err != nil {
+		ctx.ErrC <- errors.Wrap(err, "Error performing direct reads of collections")
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go ctx.waitForConnection(&wg, s, options)
+		wg.Wait()
+		if ctx.isStopped() {
+			return
+		}
+		ctx.allWg.Add(1)
+		ctx.DirectReadWg.Add(1)
+		go DirectRead(ctx, session, ns, options)
 	}
 	return
 }
@@ -928,6 +1045,7 @@ func DirectRead(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (
 func FetchDocuments(ctx *OpCtx, session *mgo.Session, filter OpFilter, buf *OpBuf, inOp OpChan, options *Options) error {
 	defer ctx.allWg.Done()
 	s := session.Copy()
+	s.SetMode(mgo.Eventual, true)
 	defer s.Close()
 	for {
 		select {
@@ -990,17 +1108,14 @@ func DefaultOptions() *Options {
 		OpLogDatabaseName:   nil,
 		OpLogCollectionName: nil,
 		CursorTimeout:       nil,
-		ChannelSize:         512,
+		ChannelSize:         2048,
 		BufferSize:          50,
 		BufferDuration:      time.Duration(750) * time.Millisecond,
-		EOFDuration:         time.Duration(5) * time.Second,
 		Ordering:            Oplog,
 		WorkerCount:         1,
 		UpdateDataAsDelta:   false,
 		DirectReadNs:        []string{},
 		DirectReadFilter:    nil,
-		DirectReadBatchSize: 500,
-		DirectReadCursors:   10,
 		Unmarshal:           defaultUnmarshaller,
 		Log:                 log.New(os.Stdout, "INFO ", log.Flags()),
 	}
@@ -1053,15 +1168,6 @@ func (this *Options) SetDefaults() {
 	if this.UpdateDataAsDelta {
 		this.Ordering = Oplog
 		this.WorkerCount = 0
-	}
-	if this.DirectReadBatchSize < 1 {
-		this.DirectReadBatchSize = defaultOpts.DirectReadBatchSize
-	}
-	if this.DirectReadCursors < 1 {
-		this.DirectReadCursors = defaultOpts.DirectReadCursors
-	}
-	if this.EOFDuration == 0 {
-		this.EOFDuration = defaultOpts.EOFDuration
 	}
 	if this.Unmarshal == nil {
 		this.Unmarshal = defaultOpts.Unmarshal
@@ -1212,26 +1318,10 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 		go FetchDocuments(ctx, session, filter, buf, inOp, options)
 	}
 
-	var scanOk bool
-	var err error
-	if len(options.DirectReadNs) > 0 {
-		scanOk, err = SupportsCollectionScan(session)
-		if err != nil {
-			ctx.ErrC <- errors.Wrap(err, "Error determining collection scan support")
-		}
-		if scanOk {
-			ctx.log.Println("Direct read parallel collection scan is ON")
-		}
-	}
-
 	for _, ns := range options.DirectReadNs {
 		directReadWg.Add(1)
 		allWg.Add(1)
-		if scanOk {
-			go DirectReadCollectionScan(ctx, session, ns, options)
-		} else {
-			go DirectRead(ctx, session, ns, options)
-		}
+		go DirectReadSplitVector(ctx, session, ns, options)
 	}
 
 	allWg.Add(1)

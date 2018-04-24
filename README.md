@@ -86,7 +86,6 @@ It can be used to send emails to new users, [index documents](https://www.github
 		Ordering:            gtm.Document,  // defaults to gtm.Oplog. ordering guarantee of events on the output channel
 		UpdateDataAsDelta:   false,         // set to true to only receive delta information in the Data field on updates (info straight from oplog)
 		DirectReadNs: []string{"db.users"}, // set to a slice of namespaces to read data directly from bypassing the oplog
-	        DirectReadCursors:   10,            // determines the requested number of cursors to parallelCollectionScan
 		Log:                 myLogger,      // pass your own logger
 	})
 
@@ -215,17 +214,27 @@ If you have your multiple filters you can use the gtm utility method ChainOpFilt
 	
 	func ChainOpFilters(filters ...OpFilter) OpFilter
 
-### Parallel Collection Scans ###
+### Optimizing Direct Read Throughput ###
 
-Gtm will attempt to enable MongoDB's parallel collection scan feature for direct reads.  Currently when using the WiredTiger
-storage engine this will be disabled since WiredTiger only returns 1 cursor.  In the future, when WiredTiger is enhanced to 
-support more than 1 cursor on a parallel collection scan, Gtm should enable and use multiple cursors without an upgrade.  
+To get the best througput possible on direct reads you will want to consider the indexes on your collections.  In the best
+case scenario, for very large collections, you will have an index on a field with a moderately low cardinality.
+For example, if you have 10 million documents in your collection and have a field named `category` that will have a
+value between 1 and 20, and you have an index of this field, then gtm will be able to perform an `internal` MongoDB admin
+command named `splitVector` on this key.  The results of the split vector command will return all of the categories which exist in
+the collection up to 24 splits.  Once gtm has the split points it is able to start splits+1 go routines with range
+queries to consume the entire collection concurrently. You will notice a line in the log like this is this is working.
 
-So, currently to get a massive speed up on direct reads one needs to use the mmapv1 storage engine which unfortunately is not the
-default.
+	INFO 2018/04/24 18:23:23 Found 16 splits (17 segments) for namespace test.test using index on category
 
-The number of cursors requested per collection is configurable via `DirectReadCursors`.  The number of cursors actually returned by
-MongoDB may be less than the requested amount.  
+When this is working you will notice the connection count increase substancially in `mongostat`.  On the other hand, if you
+do not have an index which yields a high number splits, gtm will force a split and it will only be able to start 2 go 
+routines to read your collection concurrently. 
 
-For more information on see [Parallel Collection Scan](https://docs.mongodb.com/manual/reference/command/parallelCollectionScan/).
+The user that gtm connects with will need to have admin access to perform the `splitVector` command.  If the user does not have
+this access then gtm using a traditional cursor read of each collection in a single go routine. This can be very slow for collections
+on the order of millions of documents.
+
+Gtm previously supported the `parallelCollectionScan` command to get multiple read cursors on a collection.
+However, this command only worked on the mmapv1 storage engine and will be `removed` completely once the mmapv1 engine is retired.
+It looks like `splitVector` or something like it will be promoted in new versions on MongoDB.  
 
