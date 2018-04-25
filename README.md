@@ -220,9 +220,9 @@ To get the best througput possible on direct reads you will want to consider the
 case scenario, for very large collections, you will have an index on a field with a moderately low cardinality.
 For example, if you have 10 million documents in your collection and have a field named `category` that will have a
 value between 1 and 20, and you have an index of this field, then gtm will be able to perform an `internal` MongoDB admin
-command named `splitVector` on this key.  The results of the split vector command will return all of the categories which exist in
-the collection up to 24 splits.  Once gtm has the split points it is able to start splits+1 go routines with range
-queries to consume the entire collection concurrently. You will notice a line in the log like this is this is working.
+command named `splitVector` on this key.  The results of the split vector command will return a sorted list of category split points.
+Once gtm has the split points it is able to start splits+1 go routines with range queries to consume the entire collection concurrently. 
+You will notice a line in the log like this is this is working.
 
 	INFO 2018/04/24 18:23:23 Found 16 splits (17 segments) for namespace test.test using index on category
 
@@ -231,8 +231,7 @@ do not have an index which yields a high number splits, gtm will force a split a
 routines to read your collection concurrently. 
 
 The user that gtm connects with will need to have admin access to perform the `splitVector` command.  If the user does not have
-this access then gtm using a traditional cursor read of each collection in a single go routine. This can be very slow for collections
-on the order of millions of documents.
+this access then gtm will use paginating range read of each collection.
 
 Gtm previously supported the `parallelCollectionScan` command to get multiple read cursors on a collection.
 However, this command only worked on the mmapv1 storage engine and will be `removed` completely once the mmapv1 engine is retired.
