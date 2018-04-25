@@ -951,7 +951,7 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 			}
 		}
 		if err = iter.Close(); err != nil {
-			ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error completing direct reads of collection %s. Will retry segment from last document processed"))
+			ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error completing direct reads of collection %s. Will retry segment from last document processed", ns))
 			var wg sync.WaitGroup
 			wg.Add(1)
 			go ctx.waitForConnection(&wg, s, options)
