@@ -826,8 +826,9 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 		doPagedRead()
 		return
 	}
+	const maxSplits = 8
 	var splitMax, splitMin int
-	splitMin = 8
+	splitMin = 4
 	bestSplit := &CollectionSegment{
 		splitKey: "_id",
 	}
@@ -835,6 +836,9 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 		key := strings.TrimPrefix(index.Key[0], "-")
 		if key == "_id" {
 			continue
+		}
+		if splitMax >= maxSplits {
+			break
 		}
 		cseg := &CollectionSegment{
 			splitKey: key,
@@ -846,11 +850,12 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 				dir = -1
 			}
 			splitv := SplitVectorRequest{
-				SplitVector:  ns,
-				KeyPattern:   bson.M{cseg.splitKey: dir},
-				Min:          cseg.min,
-				Max:          cseg.max,
-				MaxChunkSize: 12,
+				SplitVector:    ns,
+				KeyPattern:     bson.M{cseg.splitKey: dir},
+				Min:            cseg.min,
+				Max:            cseg.max,
+				MaxChunkSize:   8,
+				MaxSplitPoints: maxSplits,
 			}
 			var result SplitVectorResult
 			err = session.Run(splitv, &result)
@@ -901,7 +906,7 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 	}
 	c := s.DB(n.database).C(n.collection)
 	sel := seg.toSelector()
-	q := c.Find(sel)
+	q := c.Find(sel).Batch(1000)
 	iter := q.Iter()
 	var result = &bson.Raw{}
 	for iter.Next(&result) {
@@ -960,12 +965,12 @@ func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Optio
 	}
 	c := s.DB(n.database).C(n.collection)
 	const segmentSize int = 50 << 10
-	const maxSegs int = 24
+	const maxSplits int = 8
 	segment := &CollectionSegment{
 		splitKey: "_id",
 	}
 	var doc Doc
-	var segCount int
+	var splitCount int
 	pro := bson.M{"_id": 1}
 	done := false
 	for !done {
@@ -989,8 +994,8 @@ func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Optio
 				splitKey: "_id",
 				min:      segment.max,
 			}
-			segCount = segCount + 1
-			if segCount == maxSegs {
+			splitCount = splitCount + 1
+			if splitCount == maxSplits {
 				done = true
 				ctx.allWg.Add(1)
 				ctx.DirectReadWg.Add(1)
