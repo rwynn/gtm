@@ -100,20 +100,6 @@ func (cs *CollectionSegment) shrinkTo(next interface{}) {
 	cs.max = next
 }
 
-func (cs *CollectionSegment) toSelectorMinID(id interface{}) bson.M {
-	sel := cs.toSelector()
-	if id != nil {
-		if cs.splitKey == "_id" {
-			rang := sel[cs.splitKey].(bson.M)
-			delete(rang, "$gte")
-			rang["$gt"] = id
-		} else {
-			sel["_id"] = bson.M{"$gt": id}
-		}
-	}
-	return sel
-}
-
 func (cs *CollectionSegment) toSelector() bson.M {
 	sel := bson.M{}
 	rang := bson.M{}
@@ -906,6 +892,7 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
 	s := session.Copy()
+	s.SetCursorTimeout(0) // keep this cursor alive
 	defer s.Close()
 	n := &N{}
 	if err = n.parse(ns); err != nil {
@@ -914,56 +901,49 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 	}
 	c := s.DB(n.database).C(n.collection)
 	sel := seg.toSelector()
-	var lastID interface{} = nil // keep track to last ID to resume on errors
-	for {
-		q := c.Find(sel)
-		iter := q.Iter()
-		var hasResults = false
-		var result = &bson.Raw{}
-		for iter.Next(&result) {
-			hasResults = true
-			doc := bson.M{}
-			result.Unmarshal(&doc)
-			t := time.Now().UTC().Unix()
-			lastID = doc["_id"]
-			op := &Op{
-				Id:        doc["_id"],
-				Operation: "i",
-				Namespace: ns,
-				Source:    DirectQuerySource,
-				Timestamp: bson.MongoTimestamp(t << 32),
-			}
-			if u, err := options.Unmarshal(ns, result); err == nil {
-				op.processData(u)
-				if op.matchesDirectFilter(options) {
-					ctx.OpC <- op
-				}
-			} else {
-				ctx.ErrC <- err
-			}
-			result = &bson.Raw{}
-			select {
-			case <-ctx.stopC:
-				iter.Close()
-				return
-			default:
-				continue
-			}
+	q := c.Find(sel)
+	iter := q.Iter()
+	var result = &bson.Raw{}
+	for iter.Next(&result) {
+		doc := bson.M{}
+		result.Unmarshal(&doc)
+		t := time.Now().UTC().Unix()
+		op := &Op{
+			Id:        doc["_id"],
+			Operation: "i",
+			Namespace: ns,
+			Source:    DirectQuerySource,
+			Timestamp: bson.MongoTimestamp(t << 32),
 		}
-		if err = iter.Close(); err != nil {
-			ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error completing direct reads of collection %s. Will retry segment from last document processed", ns))
-			var wg sync.WaitGroup
-			wg.Add(1)
-			go ctx.waitForConnection(&wg, s, options)
-			wg.Wait()
-			if ctx.isStopped() {
-				return
+		if u, err := options.Unmarshal(ns, result); err == nil {
+			op.processData(u)
+			if op.matchesDirectFilter(options) {
+				ctx.OpC <- op
 			}
-			s.Refresh()
-			sel = seg.toSelectorMinID(lastID)
-		} else if !hasResults {
-			break
+		} else {
+			ctx.ErrC <- err
 		}
+		result = &bson.Raw{}
+		select {
+		case <-ctx.stopC:
+			iter.Close()
+			return
+		default:
+			continue
+		}
+	}
+	if err = iter.Close(); err != nil {
+		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error reading segment of collection %s. Will retry segment.", ns))
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go ctx.waitForConnection(&wg, s, options)
+		wg.Wait()
+		if ctx.isStopped() {
+			return
+		}
+		ctx.allWg.Add(1)
+		ctx.DirectReadWg.Add(1)
+		go DirectReadSegment(ctx, session, ns, options, seg)
 	}
 	return
 }
