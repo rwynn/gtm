@@ -1284,7 +1284,7 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 	for _, ns := range options.DirectReadNs {
 		directReadWg.Add(1)
 		allWg.Add(1)
-		go DirectReadSplitVector(ctx, session, ns, options)
+		go DirectReadPaged(ctx, session, ns, options)
 	}
 
 	allWg.Add(1)
