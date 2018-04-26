@@ -88,6 +88,11 @@ type Doc struct {
 	Id interface{} "_id"
 }
 
+type CollectionStats struct {
+	Count         int64 "count"
+	AvgObjectSize int64 "avgObjSize"
+}
+
 type CollectionSegment struct {
 	min         interface{}
 	max         interface{}
@@ -818,6 +823,11 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
 		return
 	}
+	var stats *CollectionStats
+	stats, err = GetCollectionStats(ctx, session, ns)
+	if err != nil {
+		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error reading collection stats for %s. Used to calibrate batch size.", ns))
+	}
 	col := session.DB(n.database).C(n.collection)
 	indexes, err := col.Indexes()
 	if err != nil {
@@ -884,7 +894,7 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 			for _, subseg := range bestSplit.subSegments {
 				ctx.allWg.Add(1)
 				ctx.DirectReadWg.Add(1)
-				go DirectReadSegment(ctx, session, ns, options, subseg)
+				go DirectReadSegment(ctx, session, ns, options, subseg, stats)
 			}
 		} else {
 			doPagedRead()
@@ -893,7 +903,18 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 	return
 }
 
-func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Options, seg *CollectionSegment) (err error) {
+func GetCollectionStats(ctx *OpCtx, session *mgo.Session, ns string) (stats *CollectionStats, err error) {
+	stats = &CollectionStats{}
+	n := &N{}
+	if err = n.parse(ns); err != nil {
+		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
+		return
+	}
+	err = session.DB(n.database).Run(bson.D{{"collStats", n.collection}}, stats)
+	return
+}
+
+func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Options, seg *CollectionSegment, stats *CollectionStats) (err error) {
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
 	s := session.Copy()
@@ -904,9 +925,21 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
 		return
 	}
+	var batch int64 = 1000
+	if stats.AvgObjectSize != 0 {
+		batch = (5 << 20) / stats.AvgObjectSize // 5MB divided by avg doc size
+		if batch < 1000 {
+			// leave it up to the server
+			batch = 0
+		}
+	}
 	c := s.DB(n.database).C(n.collection)
 	sel := seg.toSelector()
-	q := c.Find(sel).Batch(1000)
+	q := c.Find(sel)
+	if batch != 0 {
+		q.Batch(int(batch))
+	}
+	q.Prefetch(0.5)
 	iter := q.Iter()
 	var result = &bson.Raw{}
 	for iter.Next(&result) {
@@ -948,7 +981,7 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 		}
 		ctx.allWg.Add(1)
 		ctx.DirectReadWg.Add(1)
-		go DirectReadSegment(ctx, session, ns, options, seg)
+		go DirectReadSegment(ctx, session, ns, options, seg, stats)
 	}
 	return
 }
@@ -962,6 +995,11 @@ func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Optio
 	if err = n.parse(ns); err != nil {
 		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
 		return
+	}
+	var stats *CollectionStats
+	stats, err = GetCollectionStats(ctx, session, ns)
+	if err != nil {
+		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error reading collection stats for %s. Used to calibrate batch size.", ns))
 	}
 	c := s.DB(n.database).C(n.collection)
 	const segmentSize int = 50 << 10
@@ -988,7 +1026,7 @@ func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Optio
 		}
 		ctx.allWg.Add(1)
 		ctx.DirectReadWg.Add(1)
-		go DirectReadSegment(ctx, session, ns, options, segment)
+		go DirectReadSegment(ctx, session, ns, options, segment, stats)
 		if !done {
 			segment = &CollectionSegment{
 				splitKey: "_id",
@@ -999,7 +1037,7 @@ func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Optio
 				done = true
 				ctx.allWg.Add(1)
 				ctx.DirectReadWg.Add(1)
-				go DirectReadSegment(ctx, session, ns, options, segment)
+				go DirectReadSegment(ctx, session, ns, options, segment, stats)
 			}
 		}
 	}
