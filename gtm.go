@@ -46,6 +46,7 @@ type Options struct {
 	DirectReadNs        []string
 	DirectReadFilter    OpFilter
 	Unmarshal           DataUnmarshaller
+	SplitVector         bool
 	Log                 *log.Logger
 }
 
@@ -839,7 +840,7 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 		doPagedRead()
 		return
 	}
-	const maxSplits = 8
+	const maxSplits = 32
 	var splitMax, splitMin int
 	splitMin = 4
 	bestSplit := &CollectionSegment{
@@ -921,6 +922,7 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
 	s := session.Copy()
+	s.SetMode(mgo.Nearest, true)
 	s.SetCursorTimeout(0) // keep this cursor alive
 	defer s.Close()
 	n := &N{}
@@ -930,7 +932,7 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 	}
 	var batch int64 = 1000
 	if stats.AvgObjectSize != 0 {
-		batch = (5 << 20) / stats.AvgObjectSize // 5MB divided by avg doc size
+		batch = (5 * 2048 * 2048) / stats.AvgObjectSize // 5MB divided by avg doc size
 		if batch < 1000 {
 			// leave it up to the server
 			batch = 0
@@ -942,7 +944,6 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 	if batch != 0 {
 		q.Batch(int(batch))
 	}
-	q.Prefetch(0.5)
 	iter := q.Iter()
 	var result = &bson.Raw{}
 	for iter.Next(&result) {
@@ -1005,8 +1006,15 @@ func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Optio
 		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error reading collection stats for %s. Used to calibrate batch size.", ns))
 	}
 	c := s.DB(n.database).C(n.collection)
-	const segmentSize int = 50 << 10
-	const maxSplits int = 8
+	const defaultSegmentSize = 50000
+	var maxSplits int = 32 // limit the number of connections generated
+	var segmentSize int = defaultSegmentSize
+	if stats.Count != 0 {
+		segmentSize = int(stats.Count) / (maxSplits + 1)
+		if segmentSize < defaultSegmentSize {
+			segmentSize = defaultSegmentSize
+		}
+	}
 	segment := &CollectionSegment{
 		splitKey: "_id",
 	}
@@ -1121,6 +1129,7 @@ func DefaultOptions() *Options {
 		DirectReadNs:        []string{},
 		DirectReadFilter:    nil,
 		Unmarshal:           defaultUnmarshaller,
+		SplitVector:         false,
 		Log:                 log.New(os.Stdout, "INFO ", log.Flags()),
 	}
 }
@@ -1325,7 +1334,11 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 	for _, ns := range options.DirectReadNs {
 		directReadWg.Add(1)
 		allWg.Add(1)
-		go DirectReadPaged(ctx, session, ns, options)
+		if options.SplitVector {
+			go DirectReadSplitVector(ctx, session, ns, options)
+		} else {
+			go DirectReadPaged(ctx, session, ns, options)
+		}
 	}
 
 	allWg.Add(1)
