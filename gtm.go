@@ -106,7 +106,7 @@ func (cs *CollectionSegment) shrinkTo(next interface{}) {
 }
 
 func (cs *CollectionSegment) toSelector() bson.M {
-	sel := bson.M{}
+	var sel bson.M
 	rang := bson.M{}
 	if cs.max != nil {
 		rang["$lt"] = cs.max
@@ -114,7 +114,10 @@ func (cs *CollectionSegment) toSelector() bson.M {
 	if cs.min != nil {
 		rang["$gte"] = cs.min
 	}
-	sel[cs.splitKey] = rang
+	if len(rang) > 0 {
+		sel = bson.M{}
+		sel[cs.splitKey] = rang
+	}
 	return sel
 }
 
