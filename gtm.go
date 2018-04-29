@@ -932,7 +932,7 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 	}
 	var batch int64 = 1000
 	if stats.AvgObjectSize != 0 {
-		batch = (5 * 2048 * 2048) / stats.AvgObjectSize // 5MB divided by avg doc size
+		batch = (8 * 1024 * 1024) / stats.AvgObjectSize // 8MB divided by avg doc size
 		if batch < 1000 {
 			// leave it up to the server
 			batch = 0
