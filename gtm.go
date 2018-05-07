@@ -45,6 +45,7 @@ type Options struct {
 	UpdateDataAsDelta   bool
 	DirectReadNs        []string
 	DirectReadFilter    OpFilter
+	DirectReadSplitMax  int
 	Unmarshal           DataUnmarshaller
 	SplitVector         bool
 	Log                 *log.Logger
@@ -840,7 +841,7 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 		doPagedRead()
 		return
 	}
-	const maxSplits = 9
+	var maxSplits = options.DirectReadSplitMax
 	var splitMax, splitMin int
 	splitMin = 4
 	bestSplit := &CollectionSegment{
@@ -1007,7 +1008,7 @@ func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Optio
 	}
 	c := s.DB(n.database).C(n.collection)
 	const defaultSegmentSize = 50000
-	var maxSplits int = 9 // limit the number of connections generated
+	var maxSplits = options.DirectReadSplitMax
 	var segmentSize int = defaultSegmentSize
 	if stats.Count != 0 {
 		segmentSize = int(stats.Count) / (maxSplits + 1)
@@ -1128,6 +1129,7 @@ func DefaultOptions() *Options {
 		UpdateDataAsDelta:   false,
 		DirectReadNs:        []string{},
 		DirectReadFilter:    nil,
+		DirectReadSplitMax:  9,
 		Unmarshal:           defaultUnmarshaller,
 		SplitVector:         false,
 		Log:                 log.New(os.Stdout, "INFO ", log.Flags()),
@@ -1187,6 +1189,9 @@ func (this *Options) SetDefaults() {
 	}
 	if this.Log == nil {
 		this.Log = defaultOpts.Log
+	}
+	if this.DirectReadSplitMax < 1 {
+		this.DirectReadSplitMax = defaultOpts.DirectReadSplitMax
 	}
 }
 

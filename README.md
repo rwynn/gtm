@@ -86,6 +86,8 @@ It can be used to send emails to new users, [index documents](https://www.github
 		Ordering:            gtm.Document,  // defaults to gtm.Oplog. ordering guarantee of events on the output channel
 		UpdateDataAsDelta:   false,         // set to true to only receive delta information in the Data field on updates (info straight from oplog)
 		DirectReadNs: []string{"db.users"}, // set to a slice of namespaces to read data directly from bypassing the oplog
+		DirectReadSplitMax:  9,             // the max number of times to split a collection for concurrent reads (impacts memory consumption)
+		SplitVector:         false          // whether or not to use internal MongoDB command split vector to split collections
 		Log:                 myLogger,      // pass your own logger
 	})
 
@@ -214,7 +216,7 @@ If you have your multiple filters you can use the gtm utility method ChainOpFilt
 	
 	func ChainOpFilters(filters ...OpFilter) OpFilter
 
-### Optimizing Direct Read Throughput ###
+### Optimizing Direct Read Throughput with SplitVector enabled ###
 
 To get the best througput possible on direct reads you will want to consider the indexes on your collections.  In the best
 case scenario, for very large collections, you will have an index on a field with a moderately low cardinality.
