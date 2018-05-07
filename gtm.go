@@ -840,7 +840,7 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 		doPagedRead()
 		return
 	}
-	const maxSplits = 12
+	const maxSplits = 9
 	var splitMax, splitMin int
 	splitMin = 4
 	bestSplit := &CollectionSegment{
@@ -1007,7 +1007,7 @@ func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Optio
 	}
 	c := s.DB(n.database).C(n.collection)
 	const defaultSegmentSize = 50000
-	var maxSplits int = 12 // limit the number of connections generated
+	var maxSplits int = 9 // limit the number of connections generated
 	var segmentSize int = defaultSegmentSize
 	if stats.Count != 0 {
 		segmentSize = int(stats.Count) / (maxSplits + 1)
