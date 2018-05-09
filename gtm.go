@@ -718,6 +718,19 @@ func GetOpLogQuery(session *mgo.Session, after bson.MongoTimestamp, options *Opt
 	return collection.Find(query).LogReplay().Sort("$natural")
 }
 
+func opDataReady(op *Op, options *Options) (ready bool) {
+	if options.UpdateDataAsDelta {
+		ready = true
+	} else if options.Ordering == AnyOrder {
+		if op.IsUpdate() {
+			ready = op.Data != nil || op.Doc != nil
+		} else {
+			ready = true
+		}
+	}
+	return
+}
+
 func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Options) error {
 	defer ctx.allWg.Done()
 	s := session.Copy()
@@ -744,9 +757,7 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 			ok, err := op.ParseLogEntry(&entry, options)
 			if err == nil {
 				if ok && op.matchesFilter(options) {
-					if options.UpdateDataAsDelta {
-						ctx.OpC <- op
-					} else if options.Ordering == AnyOrder && (op.IsInsert() || op.IsDelete()) {
+					if opDataReady(op, options) {
 						ctx.OpC <- op
 					} else {
 						// broadcast to fetch channels
