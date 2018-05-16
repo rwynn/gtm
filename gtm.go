@@ -959,11 +959,11 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 	iter := q.Iter()
 	var result = &bson.Raw{}
 	for iter.Next(&result) {
-		doc := bson.M{}
+		var doc Doc
 		result.Unmarshal(&doc)
 		t := time.Now().UTC().Unix()
 		op := &Op{
-			Id:        doc["_id"],
+			Id:        doc.Id,
 			Operation: "i",
 			Namespace: ns,
 			Source:    DirectQuerySource,
