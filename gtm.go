@@ -36,7 +36,6 @@ type Options struct {
 	NamespaceFilter     OpFilter
 	OpLogDatabaseName   *string
 	OpLogCollectionName *string
-	CursorTimeout       *string
 	ChannelSize         int
 	BufferSize          int
 	BufferDuration      time.Duration
@@ -734,17 +733,32 @@ func opDataReady(op *Op, options *Options) (ready bool) {
 func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Options) error {
 	defer ctx.allWg.Done()
 	s := session.Copy()
+	s.SetCursorTimeout(0) // keep this cursor alive
 	defer s.Close()
 	options.Fill(s)
-	duration, err := time.ParseDuration(*options.CursorTimeout)
-	if err != nil {
-		panic(fmt.Sprintf("Invalid value <%s> for CursorTimeout", *options.CursorTimeout))
-	}
 	currTimestamp := options.After(s, options)
-	iter := GetOpLogQuery(s, currTimestamp, options).Tail(duration)
+	var iter *mgo.Iter
+	var err error
+	sendError := func(err error) {
+		ctx.ErrC <- errors.Wrap(err, "Error tailing oplog entries")
+	}
+Seek:
 	for {
 		var entry OpLog
-	Seek:
+		if iter != nil {
+			if err = iter.Close(); err != nil {
+				sendError(err)
+				var wg sync.WaitGroup
+				wg.Add(1)
+				go ctx.waitForConnection(&wg, s, options)
+				wg.Wait()
+				if ctx.isStopped() {
+					return nil
+				}
+				s.Refresh()
+			}
+		}
+		iter = GetOpLogQuery(s, currTimestamp, options).Tail(-1)
 		for iter.Next(&entry) {
 			op := &Op{
 				Id:        "",
@@ -767,10 +781,13 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 					}
 				}
 			} else {
-				ctx.ErrC <- err
+				sendError(err)
 			}
 			select {
 			case <-ctx.stopC:
+				if err = iter.Close(); err != nil {
+					sendError(err)
+				}
 				return nil
 			case ts := <-ctx.seekC:
 				currTimestamp = ts
@@ -779,6 +796,9 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 				<-ctx.resumeC
 				select {
 				case <-ctx.stopC:
+					if err = iter.Close(); err != nil {
+						sendError(err)
+					}
 					return nil
 				case ts := <-ctx.seekC:
 					currTimestamp = ts
@@ -790,38 +810,6 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 				currTimestamp = op.Timestamp
 			}
 		}
-		if err = iter.Close(); err != nil {
-			ctx.ErrC <- errors.Wrap(err, "Error tailing oplog entries")
-			var wg sync.WaitGroup
-			wg.Add(1)
-			go ctx.waitForConnection(&wg, s, options)
-			wg.Wait()
-			if ctx.isStopped() {
-				return nil
-			}
-			s.Refresh()
-			iter = GetOpLogQuery(s, currTimestamp, options).Tail(duration)
-			continue
-		}
-		if iter.Timeout() {
-			select {
-			case <-ctx.stopC:
-				return nil
-			case ts := <-ctx.seekC:
-				currTimestamp = ts
-			case <-ctx.pauseC:
-				<-ctx.resumeC
-				select {
-				case ts := <-ctx.seekC:
-					currTimestamp = ts
-				default:
-					continue
-				}
-			default:
-				continue
-			}
-		}
-		iter = GetOpLogQuery(s, currTimestamp, options).Tail(duration)
 	}
 	return nil
 }
@@ -1131,7 +1119,6 @@ func DefaultOptions() *Options {
 		NamespaceFilter:     nil,
 		OpLogDatabaseName:   nil,
 		OpLogCollectionName: nil,
-		CursorTimeout:       nil,
 		ChannelSize:         2048,
 		BufferSize:          50,
 		BufferDuration:      time.Duration(75) * time.Millisecond,
@@ -1158,10 +1145,6 @@ func (this *Options) Fill(session *mgo.Session) {
 	if this.OpLogCollectionName == nil {
 		defaultOpLogCollectionName := OpLogCollectionName(session, this)
 		this.OpLogCollectionName = &defaultOpLogCollectionName
-	}
-	if this.CursorTimeout == nil {
-		defaultCursorTimeout := "100s"
-		this.CursorTimeout = &defaultCursorTimeout
 	}
 }
 

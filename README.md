@@ -78,7 +78,6 @@ It can be used to send emails to new users, [index documents](https://www.github
 		After:               nil,     	    // if nil defaults to LastOpTimestamp
 		OpLogDatabaseName:   nil,     	    // defaults to "local"
 		OpLogCollectionName: nil,     	    // defaults to a collection prefixed "oplog."
-		CursorTimeout:       nil,     	    // defaults to 100s
 		ChannelSize:         0,       	    // defaults to 20
 		BufferSize:          25,            // defaults to 50. used to batch fetch documents on bursts of activity
 		BufferDuration:      0,             // defaults to 750 ms. after this timeout the batch is force fetched
