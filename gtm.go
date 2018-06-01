@@ -36,6 +36,7 @@ type Options struct {
 	NamespaceFilter     OpFilter
 	OpLogDatabaseName   *string
 	OpLogCollectionName *string
+	CursorTimeout       *string // deprecated
 	ChannelSize         int
 	BufferSize          int
 	BufferDuration      time.Duration
