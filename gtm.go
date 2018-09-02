@@ -205,6 +205,7 @@ type OpCtxMulti struct {
 	OpC          OpChan
 	ErrC         chan error
 	DirectReadWg *sync.WaitGroup
+	opWg         *sync.WaitGroup
 	stopC        chan bool
 	allWg        *sync.WaitGroup
 	seekC        chan bson.MongoTimestamp
@@ -320,6 +321,8 @@ func (ctx *OpCtx) Stop() {
 		ctx.stopped = true
 		close(ctx.stopC)
 		ctx.allWg.Wait()
+		close(ctx.ErrC)
+		close(ctx.OpC)
 	}
 }
 
@@ -365,6 +368,9 @@ func (ctx *OpCtxMulti) Stop() {
 			go child.Stop()
 		}
 		ctx.allWg.Wait()
+		close(ctx.ErrC)
+		close(ctx.OpC)
+		ctx.opWg.Wait()
 	}
 }
 
@@ -1233,6 +1239,7 @@ func StartMulti(sessions []*mgo.Session, options *Options) *OpCtxMulti {
 	opC := make(OpChan, options.ChannelSize)
 
 	var directReadWg sync.WaitGroup
+	var opWg sync.WaitGroup
 	var allWg sync.WaitGroup
 	var seekC = make(chan bson.MongoTimestamp, 1)
 	var pauseC = make(chan bool, 1)
@@ -1243,6 +1250,7 @@ func StartMulti(sessions []*mgo.Session, options *Options) *OpCtxMulti {
 		OpC:          opC,
 		ErrC:         errC,
 		DirectReadWg: &directReadWg,
+		opWg:         &opWg,
 		stopC:        stopC,
 		allWg:        &allWg,
 		pauseC:       pauseC,
@@ -1267,12 +1275,16 @@ func StartMulti(sessions []*mgo.Session, options *Options) *OpCtxMulti {
 			defer allWg.Done()
 			ctx.allWg.Wait()
 		}()
+		opWg.Add(1)
 		go func(c OpChan) {
+			defer opWg.Done()
 			for op := range c {
 				opC <- op
 			}
 		}(ctx.OpC)
+		opWg.Add(1)
 		go func(c chan error) {
+			defer opWg.Done()
 			for err := range c {
 				errC <- err
 			}
