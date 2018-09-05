@@ -62,6 +62,17 @@ It can be used to send emails to new users, [index documents](https://www.github
 
 ### Configuration ###
 
+        func PipeBuilder(namespace string) ([]interface{}, error) {
+		if namespace === "users.users" {
+		        // given a set of docs like {username: "joe", email: "joe@email.com", amount: 1}
+			return []interface{}{
+				bson.M{"$match": bson.M{"username": "joe"}},
+				bson.M{"$group": bson.M{"_id": "$email", total: bson.M{"$sum", "$amount"}}},
+			}, nil
+		}
+		return nil, nil
+	}
+
 	func NewUsers(op *gtm.Op) bool {
 		return op.Namespace == "users.users" && op.IsInsert()
 	}
@@ -86,7 +97,9 @@ It can be used to send emails to new users, [index documents](https://www.github
 		UpdateDataAsDelta:   false,         // set to true to only receive delta information in the Data field on updates (info straight from oplog)
 		DirectReadNs: []string{"db.users"}, // set to a slice of namespaces to read data directly from bypassing the oplog
 		DirectReadSplitMax:  9,             // the max number of times to split a collection for concurrent reads (impacts memory consumption)
-		SplitVector:         false          // whether or not to use internal MongoDB command split vector to split collections
+		Pipe:                PipeBuilder,   // an optional function to build aggregation pipelines for direct reads given a namespace from DirectReadNs
+		PipeAllowDisk:       false,         // true to allow MongoDB to use disk for aggregation pipeline options with large result sets
+		SplitVector:         false,         // whether or not to use internal MongoDB command split vector to split collections
 		Log:                 myLogger,      // pass your own logger
 	})
 

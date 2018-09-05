@@ -47,6 +47,8 @@ type Options struct {
 	DirectReadFilter    OpFilter
 	DirectReadSplitMax  int
 	Unmarshal           DataUnmarshaller
+	Pipe                PipelineBuilder
+	PipeAllowDisk       bool
 	SplitVector         bool
 	Log                 *log.Logger
 }
@@ -176,6 +178,8 @@ type ShardInsertHandler func(*ShardInfo) (*mgo.Session, error)
 type TimestampGenerator func(*mgo.Session, *Options) bson.MongoTimestamp
 
 type DataUnmarshaller func(namespace string, raw *bson.Raw) (interface{}, error)
+
+type PipelineBuilder func(namespace string) ([]interface{}, error)
 
 type OpBuf struct {
 	Entries        []*Op
@@ -321,8 +325,8 @@ func (ctx *OpCtx) Stop() {
 		ctx.stopped = true
 		close(ctx.stopC)
 		ctx.allWg.Wait()
-		close(ctx.ErrC)
 		close(ctx.OpC)
+		close(ctx.ErrC)
 	}
 }
 
@@ -368,8 +372,8 @@ func (ctx *OpCtxMulti) Stop() {
 			go child.Stop()
 		}
 		ctx.allWg.Wait()
-		close(ctx.ErrC)
 		close(ctx.OpC)
+		close(ctx.ErrC)
 		ctx.opWg.Wait()
 	}
 }
@@ -392,8 +396,14 @@ func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardIn
 				return
 			}
 		case err := <-ctx.ErrC:
+			if err == nil {
+				break
+			}
 			multi.ErrC <- err
 		case op := <-ctx.OpC:
+			if op == nil {
+				break
+			}
 			// new shard detected
 			shardInfo := &ShardInfo{
 				hostname: op.Data["host"].(string),
@@ -407,21 +417,24 @@ func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardIn
 			multi.lock.Lock()
 			multi.contexts = append(multi.contexts, shardCtx)
 			multi.DirectReadWg.Add(1)
+			multi.allWg.Add(1)
+			multi.opWg.Add(2)
 			go func() {
 				defer multi.DirectReadWg.Done()
 				shardCtx.DirectReadWg.Wait()
 			}()
-			multi.allWg.Add(1)
 			go func() {
 				defer multi.allWg.Done()
 				shardCtx.allWg.Wait()
 			}()
 			go func(c OpChan) {
+				defer multi.opWg.Done()
 				for op := range c {
 					multi.OpC <- op
 				}
 			}(shardCtx.OpC)
 			go func(c chan error) {
+				defer multi.opWg.Done()
 				for err := range c {
 					multi.ErrC <- err
 				}
@@ -945,13 +958,33 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 			batch = 0
 		}
 	}
+	var iter *mgo.Iter
 	c := s.DB(n.database).C(n.collection)
 	sel := seg.toSelector()
 	q := c.Find(sel)
 	if batch != 0 {
 		q.Batch(int(batch))
 	}
-	iter := q.Iter()
+	iter = q.Iter()
+	if options.Pipe != nil {
+		var pipeline []interface{}
+		if pipeline, err = options.Pipe(ns); err != nil {
+			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline query.")
+			return
+		}
+		if pipeline != nil {
+			var stages []interface{}
+			stages = append(stages, bson.M{"$match": sel})
+			for _, stage := range pipeline {
+				stages = append(stages, stage)
+			}
+			pipe := c.Pipe(stages)
+			if options.PipeAllowDisk {
+				pipe = pipe.AllowDiskUse()
+			}
+			iter = pipe.Iter()
+		}
+	}
 	var result = &bson.Raw{}
 	for iter.Next(&result) {
 		var doc Doc
@@ -1073,6 +1106,9 @@ func FetchDocuments(ctx *OpCtx, session *mgo.Session, filter OpFilter, buf *OpBu
 		case <-buf.FlushTicker.C:
 			buf.Flush(s, ctx, options)
 		case op := <-inOp:
+			if op == nil {
+				break
+			}
 			if filter(op) {
 				buf.Append(op)
 				if buf.IsFull() {
@@ -1265,24 +1301,23 @@ func StartMulti(sessions []*mgo.Session, options *Options) *OpCtxMulti {
 	for _, session := range sessions {
 		ctx := Start(session, options)
 		ctxMulti.contexts = append(ctxMulti.contexts, ctx)
+		allWg.Add(1)
 		directReadWg.Add(1)
+		opWg.Add(2)
 		go func() {
 			defer directReadWg.Done()
 			ctx.DirectReadWg.Wait()
 		}()
-		allWg.Add(1)
 		go func() {
 			defer allWg.Done()
 			ctx.allWg.Wait()
 		}()
-		opWg.Add(1)
 		go func(c OpChan) {
 			defer opWg.Done()
 			for op := range c {
 				opC <- op
 			}
 		}(ctx.OpC)
-		opWg.Add(1)
 		go func(c chan error) {
 			defer opWg.Done()
 			for err := range c {
