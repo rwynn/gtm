@@ -87,6 +87,7 @@ It can be used to send emails to new users, [index documents](https://www.github
                 NamespaceFilter      nil,           // op filter function that has access to type/ns ONLY
                 Filter               nil,           // op filter function that has access to type/ns/data
 		After:               nil,     	    // if nil defaults to LastOpTimestamp
+		OpLogDisabled:       false,         // true to disable tailing the MongoDB oplog
 		OpLogDatabaseName:   nil,     	    // defaults to "local"
 		OpLogCollectionName: nil,     	    // defaults to a collection prefixed "oplog."
 		ChannelSize:         0,       	    // defaults to 20
@@ -95,12 +96,13 @@ It can be used to send emails to new users, [index documents](https://www.github
 		WorkerCount:         8,             // defaults to 1. number of go routines batch fetching concurrently
 		Ordering:            gtm.Document,  // defaults to gtm.Oplog. ordering guarantee of events on the output channel
 		UpdateDataAsDelta:   false,         // set to true to only receive delta information in the Data field on updates (info straight from oplog)
-		DirectReadNs: []string{"db.users"}, // set to a slice of namespaces to read data directly from bypassing the oplog
+		DirectReadNs:        []string{"db.users"}, // set to a slice of namespaces to read data directly from bypassing the oplog
 		DirectReadSplitMax:  9,             // the max number of times to split a collection for concurrent reads (impacts memory consumption)
 		Pipe:                PipeBuilder,   // an optional function to build aggregation pipelines for direct reads given a namespace from DirectReadNs
 		PipeAllowDisk:       false,         // true to allow MongoDB to use disk for aggregation pipeline options with large result sets
 		SplitVector:         false,         // whether or not to use internal MongoDB command split vector to split collections
 		Log:                 myLogger,      // pass your own logger
+		ChangeStreamNs       []string{"db.col1", "db.col2"}, // set to a slice to namespaces to read via MongoDB change streams
 	})
 
 ### Direct Reads ###

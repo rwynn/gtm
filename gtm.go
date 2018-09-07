@@ -34,6 +34,7 @@ type Options struct {
 	After               TimestampGenerator
 	Filter              OpFilter
 	NamespaceFilter     OpFilter
+	OpLogDisabled       bool
 	OpLogDatabaseName   *string
 	OpLogCollectionName *string
 	CursorTimeout       *string // deprecated
@@ -43,6 +44,7 @@ type Options struct {
 	Ordering            OrderingGuarantee
 	WorkerCount         int
 	UpdateDataAsDelta   bool
+	ChangeStreamNs      []string
 	DirectReadNs        []string
 	DirectReadFilter    OpFilter
 	DirectReadSplitMax  int
@@ -86,6 +88,44 @@ type SplitVectorRequest struct {
 	MaxChunkSize   int         "maxChunkSize"
 	MaxSplitPoints int         "maxSplitPoints"
 	Force          bool        "force"
+}
+
+type ChangeDoc struct {
+	DocKey    map[string]interface{} "documentKey"
+	Id        interface{}            "_id"
+	Operation string                 "operationType"
+	FullDoc   *bson.Raw              "fullDocument"
+	Namespace map[string]string      "ns"
+}
+
+func (cd *ChangeDoc) docId() interface{} {
+	return cd.DocKey["_id"]
+}
+
+func (cd *ChangeDoc) mapOperation() string {
+	if cd.Operation == "insert" {
+		return "i"
+	} else if cd.Operation == "update" || cd.Operation == "replace" {
+		return "u"
+	} else if cd.Operation == "delete" {
+		return "d"
+	} else if cd.Operation == "invalidate" {
+		return "c"
+	} else {
+		return ""
+	}
+}
+
+func (cd *ChangeDoc) hasDoc() bool {
+	return (cd.mapOperation() == "i" || cd.mapOperation() == "u") && cd.FullDoc != nil
+}
+
+func (cd *ChangeDoc) isInvalidate() bool {
+	return cd.Operation == "invalidate"
+}
+
+func (cd *ChangeDoc) mapNs() string {
+	return cd.Namespace["db"] + "." + cd.Namespace["coll"]
 }
 
 type Doc struct {
@@ -201,6 +241,7 @@ type OpCtx struct {
 	paused       bool
 	stopped      bool
 	log          *log.Logger
+	streams      int
 }
 
 type OpCtxMulti struct {
@@ -297,7 +338,9 @@ func (ctx *OpCtx) isStopped() bool {
 func (ctx *OpCtx) Since(ts bson.MongoTimestamp) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
-	ctx.seekC <- ts
+	for i := 0; i < ctx.streams; i++ {
+		ctx.seekC <- ts
+	}
 }
 
 func (ctx *OpCtx) Pause() {
@@ -305,7 +348,9 @@ func (ctx *OpCtx) Pause() {
 	defer ctx.lock.Unlock()
 	if !ctx.paused {
 		ctx.paused = true
-		ctx.pauseC <- true
+		for i := 0; i < ctx.streams; i++ {
+			ctx.pauseC <- true
+		}
 	}
 }
 
@@ -314,7 +359,9 @@ func (ctx *OpCtx) Resume() {
 	defer ctx.lock.Unlock()
 	if ctx.paused {
 		ctx.paused = false
-		ctx.resumeC <- true
+		for i := 0; i < ctx.streams; i++ {
+			ctx.resumeC <- true
+		}
 	}
 }
 
@@ -447,8 +494,15 @@ func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardIn
 func (ctx *OpCtxMulti) AddShardListener(
 	configSession *mgo.Session, shardOptions *Options, handler ShardInsertHandler) {
 	opts := DefaultOptions()
-	opts.NamespaceFilter = func(op *Op) bool {
-		return op.Namespace == "config.shards" && op.IsInsert()
+	if shardOptions != nil && shardOptions.OpLogDisabled {
+		opts.ChangeStreamNs = []string{"config.shards"}
+		opts.NamespaceFilter = func(op *Op) bool {
+			return op.IsInsert()
+		}
+	} else {
+		opts.NamespaceFilter = func(op *Op) bool {
+			return op.Namespace == "config.shards" && op.IsInsert()
+		}
 	}
 	configCtx := Start(configSession, opts)
 	ctx.allWg.Add(1)
@@ -969,7 +1023,7 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 	if options.Pipe != nil {
 		var pipeline []interface{}
 		if pipeline, err = options.Pipe(ns); err != nil {
-			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline query.")
+			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline stages.")
 			return
 		}
 		if pipeline != nil {
@@ -1028,6 +1082,96 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 		go DirectReadSegment(ctx, session, ns, options, seg, stats)
 	}
 	return
+}
+
+func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (err error) {
+	defer ctx.allWg.Done()
+	s := session.Copy()
+	defer s.Close()
+	n := &N{}
+	if err = n.parse(ns); err != nil {
+		ctx.ErrC <- errors.Wrap(err, "Error consuming change stream. Invalid namespace.")
+		return
+	}
+	c := s.DB(n.database).C(n.collection)
+	var pipeline []interface{}
+	var token *bson.Raw
+	if options.Pipe != nil {
+		var stages []interface{}
+		if stages, err = options.Pipe(ns); err != nil {
+			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline stages.")
+			return
+		}
+		if stages != nil {
+			pipeline = stages
+		}
+	}
+	for {
+		var stream *mgo.ChangeStream
+		stream, err = c.Watch(pipeline, mgo.ChangeStreamOptions{ResumeAfter: token, FullDocument: "updateLookup"})
+		if err != nil {
+			ctx.ErrC <- errors.Wrap(err, "Error consuming change stream.")
+			return
+		}
+		var changeDoc ChangeDoc
+		for stream.Next(&changeDoc) {
+			t := time.Now().UTC().Unix()
+			if changeDoc.isInvalidate() {
+				op := &Op{
+					Operation: changeDoc.mapOperation(),
+					Namespace: ns,
+					Source:    OplogQuerySource,
+					Timestamp: bson.MongoTimestamp(t << 32),
+				}
+				op.Data = map[string]interface{}{"drop": n.collection}
+				ctx.OpC <- op
+				stream.Close()
+				return
+			} else {
+				op := &Op{
+					Id:        changeDoc.docId(),
+					Operation: changeDoc.mapOperation(),
+					Namespace: ns,
+					Source:    OplogQuerySource,
+					Timestamp: bson.MongoTimestamp(t << 32),
+				}
+				if changeDoc.hasDoc() {
+					if u, err := options.Unmarshal(ns, changeDoc.FullDoc); err == nil {
+						op.processData(u)
+						if op.matchesDirectFilter(options) {
+							ctx.OpC <- op
+						}
+					} else {
+						ctx.ErrC <- err
+					}
+				} else {
+					if op.matchesDirectFilter(options) {
+						ctx.OpC <- op
+					}
+				}
+			}
+			select {
+			case <-ctx.stopC:
+				stream.Close()
+				return
+			case <-ctx.pauseC:
+				<-ctx.resumeC
+				select {
+				case <-ctx.stopC:
+					stream.Close()
+					return
+				default:
+					continue
+				}
+			default:
+				continue
+			}
+		}
+		token = stream.ResumeToken()
+		if err := stream.Close(); err != nil {
+			ctx.ErrC <- errors.Wrap(err, "Error while consuming change stream.")
+		}
+	}
 }
 
 func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (err error) {
@@ -1162,6 +1306,7 @@ func DefaultOptions() *Options {
 		NamespaceFilter:     nil,
 		OpLogDatabaseName:   nil,
 		OpLogCollectionName: nil,
+		OpLogDisabled:       false,
 		ChannelSize:         2048,
 		BufferSize:          50,
 		BufferDuration:      time.Duration(75) * time.Millisecond,
@@ -1343,9 +1488,13 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 	var workerNames []string
 	var directReadWg sync.WaitGroup
 	var allWg sync.WaitGroup
-	var seekC = make(chan bson.MongoTimestamp, 1)
-	var pauseC = make(chan bool, 1)
-	var resumeC = make(chan bool, 1)
+	streams := len(options.ChangeStreamNs)
+	if options.OpLogDisabled == false {
+		streams += 1
+	}
+	var seekC = make(chan bson.MongoTimestamp, streams)
+	var pauseC = make(chan bool, streams)
+	var resumeC = make(chan bool, streams)
 
 	ctx := &OpCtx{
 		lock:         &sync.Mutex{},
@@ -1358,24 +1507,27 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 		resumeC:      resumeC,
 		seekC:        seekC,
 		log:          options.Log,
+		streams:      streams,
 	}
 
-	for i := 1; i <= options.WorkerCount; i++ {
-		workerNames = append(workerNames, strconv.Itoa(i))
-	}
-
-	for i := 1; i <= options.WorkerCount; i++ {
-		allWg.Add(1)
-		inOp := make(OpChan, options.ChannelSize)
-		inOps = append(inOps, inOp)
-		buf := &OpBuf{
-			BufferSize:     options.BufferSize,
-			BufferDuration: options.BufferDuration,
-			FlushTicker:    time.NewTicker(options.BufferDuration),
+	if options.OpLogDisabled == false {
+		for i := 1; i <= options.WorkerCount; i++ {
+			workerNames = append(workerNames, strconv.Itoa(i))
 		}
-		worker := strconv.Itoa(i)
-		filter := OpFilterForOrdering(options.Ordering, workerNames, worker)
-		go FetchDocuments(ctx, session, filter, buf, inOp, options)
+
+		for i := 1; i <= options.WorkerCount; i++ {
+			allWg.Add(1)
+			inOp := make(OpChan, options.ChannelSize)
+			inOps = append(inOps, inOp)
+			buf := &OpBuf{
+				BufferSize:     options.BufferSize,
+				BufferDuration: options.BufferDuration,
+				FlushTicker:    time.NewTicker(options.BufferDuration),
+			}
+			worker := strconv.Itoa(i)
+			filter := OpFilterForOrdering(options.Ordering, workerNames, worker)
+			go FetchDocuments(ctx, session, filter, buf, inOp, options)
+		}
 	}
 
 	for _, ns := range options.DirectReadNs {
@@ -1388,8 +1540,15 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 		}
 	}
 
-	allWg.Add(1)
-	go TailOps(ctx, session, inOps, options)
+	for _, ns := range options.ChangeStreamNs {
+		allWg.Add(1)
+		go ConsumeChangeStream(ctx, session, ns, options)
+	}
+
+	if options.OpLogDisabled == false {
+		allWg.Add(1)
+		go TailOps(ctx, session, inOps, options)
+	}
 
 	return ctx
 }
