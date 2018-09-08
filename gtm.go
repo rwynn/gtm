@@ -219,7 +219,7 @@ type TimestampGenerator func(*mgo.Session, *Options) bson.MongoTimestamp
 
 type DataUnmarshaller func(namespace string, raw *bson.Raw) (interface{}, error)
 
-type PipelineBuilder func(namespace string) ([]interface{}, error)
+type PipelineBuilder func(namespace string, changeStream bool) ([]interface{}, error)
 
 type OpBuf struct {
 	Entries        []*Op
@@ -833,6 +833,7 @@ Seek:
 			}
 		}
 		iter = GetOpLogQuery(s, currTimestamp, options).Tail(-1)
+	retry:
 		for iter.Next(&entry) {
 			op := &Op{
 				Id:        "",
@@ -882,6 +883,17 @@ Seek:
 				}
 			default:
 				currTimestamp = op.Timestamp
+			}
+		}
+		if iter.Timeout() {
+			select {
+			case <-ctx.stopC:
+				if err = iter.Close(); err != nil {
+					sendError(err)
+				}
+				return nil
+			default:
+				goto retry
 			}
 		}
 	}
@@ -1022,7 +1034,7 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 	iter = q.Iter()
 	if options.Pipe != nil {
 		var pipeline []interface{}
-		if pipeline, err = options.Pipe(ns); err != nil {
+		if pipeline, err = options.Pipe(ns, false); err != nil {
 			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline stages.")
 			return
 		}
@@ -1039,6 +1051,7 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 			iter = pipe.Iter()
 		}
 	}
+retry:
 	var result = &bson.Raw{}
 	for iter.Next(&result) {
 		var doc Doc
@@ -1066,6 +1079,15 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 			return
 		default:
 			continue
+		}
+	}
+	if iter.Timeout() {
+		select {
+		case <-ctx.stopC:
+			iter.Close()
+			return
+		default:
+			goto retry
 		}
 	}
 	if err = iter.Close(); err != nil {
@@ -1098,7 +1120,7 @@ func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *O
 	var token *bson.Raw
 	if options.Pipe != nil {
 		var stages []interface{}
-		if stages, err = options.Pipe(ns); err != nil {
+		if stages, err = options.Pipe(ns, true); err != nil {
 			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline stages.")
 			return
 		}
@@ -1113,6 +1135,7 @@ func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *O
 			ctx.ErrC <- errors.Wrap(err, "Error consuming change stream.")
 			return
 		}
+	retry:
 		var changeDoc ChangeDoc
 		for stream.Next(&changeDoc) {
 			t := time.Now().UTC().Unix()
@@ -1165,6 +1188,15 @@ func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *O
 				}
 			default:
 				continue
+			}
+		}
+		if stream.Timeout() {
+			select {
+			case <-ctx.stopC:
+				stream.Close()
+				return
+			default:
+				goto retry
 			}
 		}
 		token = stream.ResumeToken()
