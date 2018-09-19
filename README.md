@@ -62,13 +62,19 @@ It can be used to send emails to new users, [index documents](https://www.github
 
 ### Configuration ###
 
-        func PipeBuilder(namespace string) ([]interface{}, error) {
+	func PipeBuilder(namespace string, changeStream bool) ([]interface{}, error) {
 		if namespace === "users.users" {
-		        // given a set of docs like {username: "joe", email: "joe@email.com", amount: 1}
-			return []interface{}{
-				bson.M{"$match": bson.M{"username": "joe"}},
-				bson.M{"$group": bson.M{"_id": "$email", total: bson.M{"$sum", "$amount"}}},
-			}, nil
+			// given a set of docs like {username: "joe", email: "joe@email.com", amount: 1}
+			if changeStream {
+				return []interface{}{
+					bson.M{"$match": bson.M{"fullDocument.username": "joe"}},
+				}, nil
+			} else {
+				return []interface{}{
+					bson.M{"$match": bson.M{"username": "joe"}},
+				}, nil
+
+			}
 		}
 		return nil, nil
 	}
