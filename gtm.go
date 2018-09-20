@@ -1004,6 +1004,16 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 	return
 }
 
+func notSupportedOnView(err error) bool {
+	switch e := err.(type) {
+	case *mgo.LastError:
+		return e.Code == 166 || e.Code == 167
+	case *mgo.QueryError:
+		return e.Code == 166 || e.Code == 167
+	}
+	return false
+}
+
 func GetCollectionStats(ctx *OpCtx, session *mgo.Session, ns string) (stats *CollectionStats, err error) {
 	stats = &CollectionStats{}
 	n := &N{}
@@ -1227,7 +1237,7 @@ func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Optio
 	}
 	var stats *CollectionStats
 	stats, err = GetCollectionStats(ctx, session, ns)
-	if err != nil {
+	if err != nil && notSupportedOnView(err) == false {
 		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error reading collection stats for %s. Used to calibrate batch size.", ns))
 	}
 	c := s.DB(n.database).C(n.collection)
