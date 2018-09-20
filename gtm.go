@@ -96,10 +96,21 @@ type ChangeDoc struct {
 	Operation string                 "operationType"
 	FullDoc   *bson.Raw              "fullDocument"
 	Namespace map[string]string      "ns"
+	Timestamp bson.MongoTimestamp    "clusterTime"
 }
 
 func (cd *ChangeDoc) docId() interface{} {
 	return cd.DocKey["_id"]
+}
+
+func (cd *ChangeDoc) mapTimestamp() bson.MongoTimestamp {
+	if cd.Timestamp > 0 {
+		// only supported in version 4.0
+		return cd.Timestamp
+	} else {
+		t := time.Now().UTC().Unix()
+		return bson.MongoTimestamp(t << 32)
+	}
 }
 
 func (cd *ChangeDoc) mapOperation() string {
@@ -1138,13 +1149,12 @@ func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *O
 	retry:
 		var changeDoc ChangeDoc
 		for stream.Next(&changeDoc) {
-			t := time.Now().UTC().Unix()
 			if changeDoc.isInvalidate() {
 				op := &Op{
 					Operation: changeDoc.mapOperation(),
 					Namespace: ns,
 					Source:    OplogQuerySource,
-					Timestamp: bson.MongoTimestamp(t << 32),
+					Timestamp: changeDoc.mapTimestamp(),
 				}
 				op.Data = map[string]interface{}{"drop": n.collection}
 				ctx.OpC <- op
@@ -1156,7 +1166,7 @@ func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *O
 					Operation: changeDoc.mapOperation(),
 					Namespace: ns,
 					Source:    OplogQuerySource,
-					Timestamp: bson.MongoTimestamp(t << 32),
+					Timestamp: changeDoc.mapTimestamp(),
 				}
 				if changeDoc.hasDoc() {
 					if u, err := options.Unmarshal(ns, changeDoc.FullDoc); err == nil {
