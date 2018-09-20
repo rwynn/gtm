@@ -1020,7 +1020,6 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 	defer ctx.DirectReadWg.Done()
 	s := session.Copy()
 	s.SetMode(mgo.Nearest, true)
-	s.SetCursorTimeout(0) // keep this cursor alive
 	defer s.Close()
 	n := &N{}
 	if err = n.parse(ns); err != nil {
