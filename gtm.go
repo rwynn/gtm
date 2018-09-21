@@ -925,10 +925,7 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 		return
 	}
 	var stats *CollectionStats
-	stats, err = GetCollectionStats(ctx, session, ns)
-	if err != nil {
-		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error reading collection stats for %s. Used to calibrate batch size.", ns))
-	}
+	stats, _ = GetCollectionStats(ctx, session, ns)
 	col := session.DB(n.database).C(n.collection)
 	indexes, err := col.Indexes()
 	if err != nil {
@@ -1236,10 +1233,7 @@ func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Optio
 		return
 	}
 	var stats *CollectionStats
-	stats, err = GetCollectionStats(ctx, session, ns)
-	if err != nil && notSupportedOnView(err) == false {
-		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error reading collection stats for %s. Used to calibrate batch size.", ns))
-	}
+	stats, _ = GetCollectionStats(ctx, session, ns)
 	c := s.DB(n.database).C(n.collection)
 	const defaultSegmentSize = 50000
 	var maxSplits = options.DirectReadSplitMax
