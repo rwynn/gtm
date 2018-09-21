@@ -729,7 +729,7 @@ func (this *Op) ParseLogEntry(entry *OpLog, options *Options) (include bool, err
 				var doc Doc
 				rawField.Unmarshal(&doc)
 				this.Id = doc.Id
-				if this.IsInsert() {
+				if this.IsInsert() || this.IsDelete() {
 					if u, err = options.Unmarshal(this.Namespace, rawField); err == nil {
 						this.processData(u)
 					}
