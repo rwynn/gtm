@@ -264,12 +264,12 @@ type OpCtxMulti struct {
 	opWg         *sync.WaitGroup
 	stopC        chan bool
 	allWg        *sync.WaitGroup
-	seekC        chan bson.MongoTimestamp
 	pauseC       chan bool
 	resumeC      chan bool
 	paused       bool
 	stopped      bool
 	log          *log.Logger
+	streams      int
 }
 
 type ShardInfo struct {
@@ -401,7 +401,9 @@ func (ctx *OpCtxMulti) Pause() {
 	defer ctx.lock.Unlock()
 	if !ctx.paused {
 		ctx.paused = true
-		ctx.pauseC <- true
+		for i := 0; i < ctx.streams; i++ {
+			ctx.pauseC <- true
+		}
 		for _, child := range ctx.contexts {
 			child.Pause()
 		}
@@ -413,7 +415,9 @@ func (ctx *OpCtxMulti) Resume() {
 	defer ctx.lock.Unlock()
 	if ctx.paused {
 		ctx.paused = false
-		ctx.resumeC <- true
+		for i := 0; i < ctx.streams; i++ {
+			ctx.resumeC <- true
+		}
 		for _, child := range ctx.contexts {
 			child.Resume()
 		}
@@ -504,6 +508,8 @@ func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardIn
 
 func (ctx *OpCtxMulti) AddShardListener(
 	configSession *mgo.Session, shardOptions *Options, handler ShardInsertHandler) {
+	ctx.lock.Lock()
+	defer ctx.lock.Unlock()
 	opts := DefaultOptions()
 	if shardOptions != nil && shardOptions.OpLogDisabled {
 		opts.ChangeStreamNs = []string{"config.shards"}
@@ -518,6 +524,7 @@ func (ctx *OpCtxMulti) AddShardListener(
 	configCtx := Start(configSession, opts)
 	ctx.allWg.Add(1)
 	go tailShards(ctx, configCtx, shardOptions, handler)
+	ctx.streams += 1
 }
 
 func ChainOpFilters(filters ...OpFilter) OpFilter {
@@ -626,7 +633,7 @@ func (this *OpBuf) Flush(session *mgo.Session, ctx *OpCtx, options *Options) {
 			byId[idKey] = append(byId[idKey], op)
 		}
 	}
-Retry:
+retry:
 	for n, opIds := range ns {
 		var parts = strings.SplitN(n, ".", 2)
 		var results []*bson.Raw
@@ -660,7 +667,7 @@ Retry:
 				return
 			}
 			session.Refresh()
-			break Retry
+			goto retry
 		}
 	}
 	for _, op := range this.Entries {
@@ -827,7 +834,7 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 	sendError := func(err error) {
 		ctx.ErrC <- errors.Wrap(err, "Error tailing oplog entries")
 	}
-Seek:
+seek:
 	for {
 		var entry OpLog
 		if iter != nil {
@@ -877,7 +884,7 @@ Seek:
 				return nil
 			case ts := <-ctx.seekC:
 				currTimestamp = ts
-				break Seek
+				goto seek
 			case <-ctx.pauseC:
 				<-ctx.resumeC
 				select {
@@ -888,7 +895,7 @@ Seek:
 					return nil
 				case ts := <-ctx.seekC:
 					currTimestamp = ts
-					break Seek
+					goto seek
 				default:
 					currTimestamp = op.Timestamp
 				}
@@ -1467,7 +1474,6 @@ func StartMulti(sessions []*mgo.Session, options *Options) *OpCtxMulti {
 	var directReadWg sync.WaitGroup
 	var opWg sync.WaitGroup
 	var allWg sync.WaitGroup
-	var seekC = make(chan bson.MongoTimestamp, 1)
 	var pauseC = make(chan bool, 1)
 	var resumeC = make(chan bool, 1)
 
@@ -1481,7 +1487,6 @@ func StartMulti(sessions []*mgo.Session, options *Options) *OpCtxMulti {
 		allWg:        &allWg,
 		pauseC:       pauseC,
 		resumeC:      resumeC,
-		seekC:        seekC,
 		log:          options.Log,
 	}
 
