@@ -236,7 +236,6 @@ type OpBuf struct {
 	Entries        []*Op
 	BufferSize     int
 	BufferDuration time.Duration
-	FlushTicker    *time.Ticker
 }
 
 type OpCtx struct {
@@ -618,6 +617,10 @@ func (this *OpBuf) Append(op *Op) {
 
 func (this *OpBuf) IsFull() bool {
 	return len(this.Entries) >= this.BufferSize
+}
+
+func (this *OpBuf) HasOne() bool {
+	return len(this.Entries) == 1
 }
 
 func (this *OpBuf) Flush(session *mgo.Session, ctx *OpCtx, options *Options) {
@@ -1295,11 +1298,13 @@ func FetchDocuments(ctx *OpCtx, session *mgo.Session, filter OpFilter, buf *OpBu
 	defer ctx.allWg.Done()
 	s := session.Copy()
 	defer s.Close()
+	timer := time.NewTimer(buf.BufferDuration)
+	timer.Stop()
 	for {
 		select {
 		case <-ctx.stopC:
 			return nil
-		case <-buf.FlushTicker.C:
+		case <-timer.C:
 			buf.Flush(s, ctx, options)
 		case op := <-inOp:
 			if op == nil {
@@ -1308,9 +1313,16 @@ func FetchDocuments(ctx *OpCtx, session *mgo.Session, filter OpFilter, buf *OpBu
 			if filter(op) {
 				buf.Append(op)
 				if buf.IsFull() {
+					timer.Stop()
 					buf.Flush(s, ctx, options)
-					buf.FlushTicker.Stop()
-					buf.FlushTicker = time.NewTicker(buf.BufferDuration)
+				} else if buf.HasOne() {
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					timer.Reset(buf.BufferDuration)
 				}
 			}
 		}
@@ -1572,7 +1584,6 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 			buf := &OpBuf{
 				BufferSize:     options.BufferSize,
 				BufferDuration: options.BufferDuration,
-				FlushTicker:    time.NewTicker(options.BufferDuration),
 			}
 			worker := strconv.Itoa(i)
 			filter := OpFilterForOrdering(options.Ordering, workerNames, worker)
