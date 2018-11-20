@@ -1155,16 +1155,22 @@ func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *O
 			pipeline = stages
 		}
 	}
+restart:
 	for {
 		var stream *mgo.ChangeStream
 		stream, err = c.Watch(pipeline, mgo.ChangeStreamOptions{ResumeAfter: token, FullDocument: "updateLookup"})
 		if err != nil {
-			ctx.ErrC <- errors.Wrap(err, "Error consuming change stream.")
-			return
+			ctx.ErrC <- errors.Wrap(err, "Error starting change stream. Will retry.")
+			if stream != nil {
+				stream.Close()
+			}
+			time.Sleep(time.Duration(5) * time.Second)
+			goto restart
 		}
 	retry:
 		var changeDoc ChangeDoc
 		for stream.Next(&changeDoc) {
+			token = stream.ResumeToken()
 			if changeDoc.isInvalidate() {
 				op := &Op{
 					Operation: changeDoc.mapOperation(),
@@ -1174,8 +1180,10 @@ func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *O
 				}
 				op.Data = map[string]interface{}{"drop": n.collection}
 				ctx.OpC <- op
+				token = nil
 				stream.Close()
-				return
+				time.Sleep(time.Duration(5) * time.Second)
+				goto restart
 			} else {
 				op := &Op{
 					Id:        changeDoc.docId(),
@@ -1204,13 +1212,13 @@ func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *O
 				stream.Close()
 				return
 			case <-ctx.pauseC:
+				stream.Close()
 				<-ctx.resumeC
 				select {
 				case <-ctx.stopC:
-					stream.Close()
 					return
 				default:
-					continue
+					goto restart
 				}
 			default:
 				continue
@@ -1225,9 +1233,8 @@ func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *O
 				goto retry
 			}
 		}
-		token = stream.ResumeToken()
 		if err := stream.Close(); err != nil {
-			ctx.ErrC <- errors.Wrap(err, "Error while consuming change stream.")
+			ctx.ErrC <- errors.Wrap(err, "Error consuming change stream. Will retry.")
 		}
 	}
 }
