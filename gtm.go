@@ -1145,6 +1145,7 @@ func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *O
 	c := s.DB(n.database).C(n.collection)
 	var pipeline []interface{}
 	var token *bson.Raw
+	var connected bool
 	if options.Pipe != nil {
 		var stages []interface{}
 		if stages, err = options.Pipe(ns, true); err != nil {
@@ -1160,12 +1161,29 @@ restart:
 		var stream *mgo.ChangeStream
 		stream, err = c.Watch(pipeline, mgo.ChangeStreamOptions{ResumeAfter: token, FullDocument: "updateLookup"})
 		if err != nil {
+			token = nil
+			connected = false
 			ctx.ErrC <- errors.Wrap(err, "Error starting change stream. Will retry.")
 			if stream != nil {
 				stream.Close()
 			}
-			time.Sleep(time.Duration(5) * time.Second)
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go ctx.waitForConnection(&wg, s, options)
+			wg.Wait()
+			if ctx.isStopped() {
+				return
+			}
+			s.Refresh()
 			goto restart
+		}
+		if !connected {
+			if token == nil {
+				ctx.log.Printf("Started watching changes on %s", ns)
+			} else {
+				ctx.log.Printf("Resumed watching changes on %s", ns)
+			}
+			connected = true
 		}
 	retry:
 		var changeDoc ChangeDoc
@@ -1233,8 +1251,17 @@ restart:
 				goto retry
 			}
 		}
-		if err := stream.Close(); err != nil {
+		if err = stream.Close(); err != nil {
+			connected = false
 			ctx.ErrC <- errors.Wrap(err, "Error consuming change stream. Will retry.")
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go ctx.waitForConnection(&wg, s, options)
+			wg.Wait()
+			if ctx.isStopped() {
+				return
+			}
+			s.Refresh()
 		}
 	}
 }
