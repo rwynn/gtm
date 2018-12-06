@@ -433,9 +433,9 @@ func (ctx *OpCtxMulti) Stop() {
 			go child.Stop()
 		}
 		ctx.allWg.Wait()
+		ctx.opWg.Wait()
 		close(ctx.OpC)
 		close(ctx.ErrC)
-		ctx.opWg.Wait()
 	}
 }
 
