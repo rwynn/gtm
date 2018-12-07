@@ -451,10 +451,11 @@ func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardIn
 		case <-multi.stopC:
 			return
 		case <-multi.pauseC:
-			<-multi.resumeC
 			select {
 			case <-multi.stopC:
 				return
+			case <-multi.resumeC:
+				break
 			}
 		case err := <-ctx.ErrC:
 			if err == nil {
@@ -466,16 +467,21 @@ func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardIn
 				break
 			}
 			// new shard detected
+			multi.lock.Lock()
+			if multi.stopped {
+				multi.lock.Unlock()
+				break
+			}
 			shardInfo := &ShardInfo{
 				hostname: op.Data["host"].(string),
 			}
 			shardSession, err := handler(shardInfo)
 			if err != nil {
 				multi.ErrC <- errors.Wrap(err, "Error calling shard handler")
-				continue
+				multi.lock.Unlock()
+				break
 			}
 			shardCtx := Start(shardSession, options)
-			multi.lock.Lock()
 			multi.contexts = append(multi.contexts, shardCtx)
 			multi.DirectReadWg.Add(1)
 			multi.allWg.Add(1)
@@ -889,18 +895,20 @@ seek:
 				currTimestamp = ts
 				goto seek
 			case <-ctx.pauseC:
-				<-ctx.resumeC
 				select {
+				case <-ctx.resumeC:
+					select {
+					case ts := <-ctx.seekC:
+						currTimestamp = ts
+						goto seek
+					default:
+						currTimestamp = op.Timestamp
+					}
 				case <-ctx.stopC:
 					if err = iter.Close(); err != nil {
 						sendError(err)
 					}
 					return nil
-				case ts := <-ctx.seekC:
-					currTimestamp = ts
-					goto seek
-				default:
-					currTimestamp = op.Timestamp
 				}
 			default:
 				currTimestamp = op.Timestamp
@@ -1231,12 +1239,11 @@ restart:
 				return
 			case <-ctx.pauseC:
 				stream.Close()
-				<-ctx.resumeC
 				select {
+				case <-ctx.resumeC:
+					goto restart
 				case <-ctx.stopC:
 					return
-				default:
-					goto restart
 				}
 			default:
 				continue
