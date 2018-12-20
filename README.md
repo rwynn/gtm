@@ -56,7 +56,15 @@ validate your replica set. For local testing your replica set may contain a
 				// op will be an insert, delete, update, or drop to mongo
 				// you can check which by calling 
 				// op.IsInsert(), op.IsDelete(), op.IsUpdate(), or op.IsDrop()
+
 				// op.Data will get you the full document for inserts and updates
+
+				// op.UpdateDescription will get you a map describing the set of changes
+				// as shown in https://docs.mongodb.com/manual/reference/change-events/#update-event
+				// op.UpdateDescription will only be available when you update docs via $set, $push, $unset, etc.
+				// if you replace the entire document using an update command, then you will NOT get
+				// information in op.UpdateDescription. e.g. db.update(doc, {total: "replace"});
+
 				msg := fmt.Sprintf(`Got op <%v> for object <%v> 
 				in database <%v>
 				and collection <%v>
@@ -92,7 +100,7 @@ validate your replica set. For local testing your replica set may contain a
 					bson.M{"$match": bson.M{"username": "joe"}},
 				}, nil
 			}
-		} else if namespace == "users.status" {
+		} else if namespace == "users.status" && changeStream {
 			// return a pipeline that only receives events when a document is 
 			// inserted, deleted, or a specific field is changed. In this case
 			// only a change to field1 is processed.  Changes to other fields
