@@ -49,10 +49,10 @@ validate your replica set. For local testing your replica set may contain a
 		for {
 			// loop forever receiving events	
 			select {
-			case err= <-ctx.ErrC:
+			case err := <-ctx.ErrC:
 				// handle errors
 				fmt.Println(err)
-			case op:= <-ctx.OpC:
+			case op := <-ctx.OpC:
 				// op will be an insert, delete, update, or drop to mongo
 				// you can check which by calling 
 				// op.IsInsert(), op.IsDelete(), op.IsUpdate(), or op.IsDrop()
