@@ -40,7 +40,7 @@ It can be used to send emails to new users, [index documents](https://www.github
 		for {
 			// loop forever receiving events	
 			select {
-			case err= <-ctx.ErrC:
+			case err := <-ctx.ErrC:
 				// handle errors
 				fmt.Println(err)
 			case op:= <-ctx.OpC:
@@ -63,7 +63,7 @@ It can be used to send emails to new users, [index documents](https://www.github
 ### Configuration ###
 
 	func PipeBuilder(namespace string, changeStream bool) ([]interface{}, error) {
-		if namespace === "users.users" {
+		if namespace == "users.users" {
 			// given a set of docs like {username: "joe", email: "joe@email.com", amount: 1}
 			if changeStream {
 				return []interface{}{
