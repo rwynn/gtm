@@ -40,7 +40,7 @@ It can be used to send emails to new users, [index documents](https://www.github
 		for {
 			// loop forever receiving events	
 			select {
-			case err= <-ctx.ErrC:
+			case err := <-ctx.ErrC:
 				// handle errors
 				fmt.Println(err)
 			case op:= <-ctx.OpC:
