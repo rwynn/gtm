@@ -56,13 +56,14 @@ type Options struct {
 }
 
 type Op struct {
-	Id        interface{}            `json:"_id"`
-	Operation string                 `json:"operation"`
-	Namespace string                 `json:"namespace"`
-	Data      map[string]interface{} `json:"data,omitempty"`
-	Timestamp bson.MongoTimestamp    `json:"timestamp"`
-	Source    QuerySource            `json:"source"`
-	Doc       interface{}            `json:"doc,omitempty"`
+	Id                interface{}            `json:"_id"`
+	Operation         string                 `json:"operation"`
+	Namespace         string                 `json:"namespace"`
+	Data              map[string]interface{} `json:"data,omitempty"`
+	Timestamp         bson.MongoTimestamp    `json:"timestamp"`
+	Source            QuerySource            `json:"source"`
+	Doc               interface{}            `json:"doc,omitempty"`
+	UpdateDescription map[string]interface{} `json:"updateDescription,omitempty`
 }
 
 type OpLog struct {
@@ -91,12 +92,13 @@ type SplitVectorRequest struct {
 }
 
 type ChangeDoc struct {
-	DocKey    map[string]interface{} "documentKey"
-	Id        interface{}            "_id"
-	Operation string                 "operationType"
-	FullDoc   *bson.Raw              "fullDocument"
-	Namespace map[string]string      "ns"
-	Timestamp bson.MongoTimestamp    "clusterTime"
+	DocKey            map[string]interface{} "documentKey"
+	Id                interface{}            "_id"
+	Operation         string                 "operationType"
+	FullDoc           *bson.Raw              "fullDocument"
+	Namespace         map[string]string      "ns"
+	Timestamp         bson.MongoTimestamp    "clusterTime"
+	UpdateDescription *bson.Raw              "updateDescription"
 }
 
 func (cd *ChangeDoc) docId() interface{} {
@@ -125,6 +127,10 @@ func (cd *ChangeDoc) mapOperation() string {
 	} else {
 		return ""
 	}
+}
+
+func (cd *ChangeDoc) hasUpdate() bool {
+	return cd.UpdateDescription != nil
 }
 
 func (cd *ChangeDoc) hasDoc() bool {
@@ -722,6 +728,27 @@ func (this *Op) processData(data interface{}) {
 	}
 }
 
+func (this *Op) parseOplogChange(m map[string]interface{}) {
+	changeDesc := map[string]interface{}{}
+	if !UpdateIsReplace(m) {
+		if setmap, ok := m["$set"]; ok {
+			s := map[string]interface{}{}
+			for key, val := range setmap.(map[string]interface{}) {
+				s[key] = val
+			}
+			changeDesc["updatedFields"] = s
+		}
+		if unsetmap, ok := m["$unset"]; ok {
+			s := []string{}
+			for key := range unsetmap.(map[string]interface{}) {
+				s = append(s, key)
+			}
+			changeDesc["removedFields"] = s
+		}
+	}
+	this.UpdateDescription = changeDesc
+}
+
 func (this *Op) ParseLogEntry(entry *OpLog, options *Options) (include bool, err error) {
 	var rawField *bson.Raw
 	var u interface{}
@@ -753,6 +780,7 @@ func (this *Op) ParseLogEntry(entry *OpLog, options *Options) (include bool, err
 					var changeField map[string]interface{}
 					rawField = entry.Doc
 					rawField.Unmarshal(&changeField)
+					this.parseOplogChange(changeField)
 					if options.UpdateDataAsDelta || UpdateIsReplace(changeField) {
 						if u, err = options.Unmarshal(this.Namespace, rawField); err == nil {
 							this.processData(u)
@@ -1211,25 +1239,36 @@ restart:
 				time.Sleep(time.Duration(5) * time.Second)
 				goto restart
 			} else {
-				op := &Op{
-					Id:        changeDoc.docId(),
-					Operation: changeDoc.mapOperation(),
-					Namespace: ns,
-					Source:    OplogQuerySource,
-					Timestamp: changeDoc.mapTimestamp(),
-				}
-				if changeDoc.hasDoc() {
-					if u, err := options.Unmarshal(ns, changeDoc.FullDoc); err == nil {
-						op.processData(u)
+				kind := changeDoc.mapOperation()
+				if kind != "" {
+					op := &Op{
+						Id:        changeDoc.docId(),
+						Operation: kind,
+						Namespace: ns,
+						Source:    OplogQuerySource,
+						Timestamp: changeDoc.mapTimestamp(),
+					}
+					if changeDoc.hasUpdate() {
+						var udm map[string]interface{}
+						ud := changeDoc.UpdateDescription
+						if err := ud.Unmarshal(&udm); err != nil {
+							ctx.ErrC <- err
+						}
+						op.UpdateDescription = udm
+					}
+					if changeDoc.hasDoc() {
+						if u, err := options.Unmarshal(ns, changeDoc.FullDoc); err == nil {
+							op.processData(u)
+							if op.matchesDirectFilter(options) {
+								ctx.OpC <- op
+							}
+						} else {
+							ctx.ErrC <- err
+						}
+					} else {
 						if op.matchesDirectFilter(options) {
 							ctx.OpC <- op
 						}
-					} else {
-						ctx.ErrC <- err
-					}
-				} else {
-					if op.matchesDirectFilter(options) {
-						ctx.OpC <- op
 					}
 				}
 			}

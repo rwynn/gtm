@@ -8,12 +8,21 @@ It can be used to send emails to new users, [index documents](https://www.github
 + [Go](http://golang.org/doc/install)
 + [globalsign/mgo](https://godoc.org/github.com/globalsign/mgo), a mongodb driver for Go
 + [mongodb](http://www.mongodb.org/)
-	+ Pass argument --master to mongod to ensure an oplog is created OR
-	+ Setup [replica sets](http://docs.mongodb.org/manual/tutorial/deploy-replica-set/) to create oplog
 
 ### Installation ###
 
 	go get github.com/rwynn/gtm
+
+### Setup ###
+
+gtm uses the MongoDB [oplog](https://docs.mongodb.com/manual/core/replica-set-oplog/) as an event source. 
+You will need to ensure that MongoDB is configured to produce an oplog by 
+[deploying a replica set](http://docs.mongodb.org/manual/tutorial/deploy-replica-set/).
+
+If you haven't already done so, follow the 5 step 
+[procedure](https://docs.mongodb.com/manual/tutorial/deploy-replica-set/#procedure) to initiate and 
+validate your replica set. For local testing your replica set may contain a 
+[single member](https://docs.mongodb.com/manual/tutorial/convert-standalone-to-replica-set/).
 
 ### Usage ###
 	
@@ -63,7 +72,16 @@ It can be used to send emails to new users, [index documents](https://www.github
 ### Configuration ###
 
 	func PipeBuilder(namespace string, changeStream bool) ([]interface{}, error) {
-		if namespace === "users.users" {
+
+                // to build your pipelines for change events you will want to reference
+		// the MongoDB reference for change events at 
+		// https://docs.mongodb.com/manual/reference/change-events/
+
+		// you will only receive changeStream == true when you configure gtm with
+		// ChangeStreamNS (requies MongoDB 3.6+).  You cannot build pipelines for
+		// changes using legacy direct oplog tailing
+
+		if namespace == "users.users" {
 			// given a set of docs like {username: "joe", email: "joe@email.com", amount: 1}
 			if changeStream {
 				return []interface{}{
@@ -73,8 +91,18 @@ It can be used to send emails to new users, [index documents](https://www.github
 				return []interface{}{
 					bson.M{"$match": bson.M{"username": "joe"}},
 				}, nil
-
 			}
+		} else if namespace == "users.status" {
+			// return a pipeline that only receives events when a document is 
+			// inserted, deleted, or a specific field is changed. In this case
+			// only a change to field1 is processed.  Changes to other fields
+			// do not match the pipeline query and thus you won't receive the event.
+			return []interface{}{
+				bson.M{"$match": bson.M{"$or": []interface{} {
+					bson.M{"updateDescription": bson.M{"$exists": false}},
+					bson.M{"updateDescription.updatedFields.field1": bson.M{"$exists": true}},
+				}}},
+			}, nil
 		}
 		return nil, nil
 	}
