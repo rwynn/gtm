@@ -66,12 +66,13 @@ validate your replica set. For local testing your replica set may contain a
 				// information in op.UpdateDescription. e.g. db.update(doc, {total: "replace"});
 
 				msg := fmt.Sprintf(`Got op <%v> for object <%v> 
-				in database <%v>
-				and collection <%v>
-				and data <%v>
+				in database <%v> 
+				and collection <%v> 
+				and data <%v> 
+				and change <%v> 
 				and timestamp <%v>`,
 					op.Operation, op.Id, op.GetDatabase(),
-					op.GetCollection(), op.Data, op.Timestamp)
+					op.GetCollection(), op.Data, op.UpdateDescription, op.Timestamp)
 				fmt.Println(msg) // or do something more interesting
 			}
 		}
