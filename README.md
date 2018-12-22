@@ -136,7 +136,7 @@ validate your replica set. For local testing your replica set may contain a
 		BufferSize:          25,            // defaults to 50. used to batch fetch documents on bursts of activity
 		BufferDuration:      0,             // defaults to 750 ms. after this timeout the batch is force fetched
 		WorkerCount:         8,             // defaults to 1. number of go routines batch fetching concurrently
-		Ordering:            gtm.Document,  // defaults to gtm.Oplog. ordering guarantee of events on the output channel
+		Ordering:            gtm.Document,  // defaults to gtm.Oplog. ordering guarantee of events on the output channel as compared to the oplog
 		UpdateDataAsDelta:   false,         // set to true to only receive delta information in the Data field on updates (info straight from oplog)
 		DirectReadNs:        []string{"db.users"}, // set to a slice of namespaces to read data directly from bypassing the oplog
 		DirectReadSplitMax:  9,             // the max number of times to split a collection for concurrent reads (impacts memory consumption)
@@ -161,7 +161,10 @@ You can wait till all the collections have been fully read by using the DirectRe
 
 ### Sharded Clusters ###
 
-gtm has support for sharded MongoDB clusters.  You will want to start with a connection to the MongoDBconfig server to get the list of available shards.
+If you use `ChangeStreamNs` on MongoDB 3.6+ you can ignore this section.  Native change streams in MongoDB are shard aware.  You should connect to the
+`mongos` routing server and change streams will work across shards.  This section is for those pre-3.6 that would like to read changes across all shards.
+
+gtm has support for sharded MongoDB clusters.  You will want to start with a connection to the MongoDB config server to get the list of available shards.
 
     // assuming the CONFIG server for a sharded cluster is running locally on port 27018
     configSession, err = mgo.Dial("127.0.0.1:27018")
@@ -274,7 +277,7 @@ If you have your multiple filters you can use the gtm utility method ChainOpFilt
 
 ### Optimizing Direct Read Throughput with SplitVector enabled ###
 
-To get the best througput possible on direct reads you will want to consider the indexes on your collections.  In the best
+If you enable SplitVector, to get the best througput possible on direct reads you will want to consider the indexes on your collections.  In the best
 case scenario, for very large collections, you will have an index on a field with a moderately low cardinality.
 For example, if you have 10 million documents in your collection and have a field named `category` that will have a
 value between 1 and 20, and you have an index of this field, then gtm will be able to perform an `internal` MongoDB admin
