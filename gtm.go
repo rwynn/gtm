@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+var opCodes = [...]string{"c", "i", "u", "d"}
+
+var defaultOpLogDatabaseName = "local"
+var defaultOpLogCollectionName = "oplog.rs"
+
 type OrderingGuarantee int
 
 const (
@@ -755,71 +760,46 @@ func (this *Op) ParseLogEntry(entry *OpLog, options *Options) (include bool, err
 	this.Operation = entry.Operation
 	this.Timestamp = entry.Timestamp
 	this.Namespace = entry.Namespace
-	if this.shouldParse() {
-		if this.IsCommand() {
-			var objectField map[string]interface{}
-			rawField = entry.Doc
-			err = rawField.Unmarshal(&objectField)
-			this.processData(objectField)
-		}
-		if this.matchesNsFilter(options) {
-			if this.IsInsert() || this.IsDelete() || this.IsUpdate() {
-				if this.IsUpdate() {
-					rawField = entry.Update
-				} else {
-					rawField = entry.Doc
+	if this.shouldParse() == false {
+		return
+	}
+	if this.IsCommand() {
+		var objectField map[string]interface{}
+		rawField = entry.Doc
+		err = rawField.Unmarshal(&objectField)
+		this.processData(objectField)
+	}
+	if this.matchesNsFilter(options) {
+		if this.IsInsert() || this.IsDelete() || this.IsUpdate() {
+			if this.IsUpdate() {
+				rawField = entry.Update
+			} else {
+				rawField = entry.Doc
+			}
+			var doc Doc
+			rawField.Unmarshal(&doc)
+			this.Id = doc.Id
+			if this.IsInsert() {
+				if u, err = options.Unmarshal(this.Namespace, rawField); err == nil {
+					this.processData(u)
 				}
-				var doc Doc
-				rawField.Unmarshal(&doc)
-				this.Id = doc.Id
-				if this.IsInsert() {
+			} else if this.IsUpdate() {
+				var changeField map[string]interface{}
+				rawField = entry.Doc
+				rawField.Unmarshal(&changeField)
+				this.parseOplogChange(changeField)
+				if options.UpdateDataAsDelta || UpdateIsReplace(changeField) {
 					if u, err = options.Unmarshal(this.Namespace, rawField); err == nil {
 						this.processData(u)
 					}
-				} else if this.IsUpdate() {
-					var changeField map[string]interface{}
-					rawField = entry.Doc
-					rawField.Unmarshal(&changeField)
-					this.parseOplogChange(changeField)
-					if options.UpdateDataAsDelta || UpdateIsReplace(changeField) {
-						if u, err = options.Unmarshal(this.Namespace, rawField); err == nil {
-							this.processData(u)
-						}
-					}
 				}
-				include = true
-			} else if this.IsCommand() {
-				include = this.IsDrop()
 			}
+			include = true
+		} else if this.IsCommand() {
+			include = this.IsDrop()
 		}
 	}
 	return
-}
-
-func OpLogCollectionName(session *mgo.Session, options *Options) string {
-	localDB := session.DB(*options.OpLogDatabaseName)
-	col_names, err := localDB.CollectionNames()
-	if err == nil {
-		var col_name *string = nil
-		for _, name := range col_names {
-			if strings.HasPrefix(name, "oplog.") {
-				col_name = &name
-				break
-			}
-		}
-		if col_name == nil {
-			msg := fmt.Sprintf(`
-				Unable to find oplog collection 
-				in database %v`, *options.OpLogDatabaseName)
-			panic(msg)
-		} else {
-			return *col_name
-		}
-	} else {
-		msg := fmt.Sprintf(`Unable to get collection names 
-		for database %v: %s`, *options.OpLogDatabaseName, err)
-		panic(msg)
-	}
 }
 
 func OpLogCollection(session *mgo.Session, options *Options) *mgo.Collection {
@@ -833,15 +813,29 @@ func ParseTimestamp(timestamp bson.MongoTimestamp) (int32, int32) {
 	return int32(ts), int32(ordinal)
 }
 
+func validOps() bson.M {
+	return bson.M{"op": bson.M{"$in": opCodes}}
+}
+
 func LastOpTimestamp(session *mgo.Session, options *Options) bson.MongoTimestamp {
 	var opLog OpLog
 	collection := OpLogCollection(session, options)
-	collection.Find(nil).Sort("-$natural").One(&opLog)
+	collection.Find(validOps()).Select(bson.M{"ts": 1}).Sort("-$natural").One(&opLog)
+	return opLog.Timestamp
+}
+
+func FirstOpTimestamp(session *mgo.Session, options *Options) bson.MongoTimestamp {
+	var opLog OpLog
+	collection := OpLogCollection(session, options)
+	collection.Find(validOps()).Select(bson.M{"ts": 1}).Sort("$natural").One(&opLog)
 	return opLog.Timestamp
 }
 
 func GetOpLogQuery(session *mgo.Session, after bson.MongoTimestamp, options *Options) *mgo.Query {
-	query := bson.M{"ts": bson.M{"$gt": after}, "fromMigrate": bson.M{"$exists": false}}
+	query := bson.M{
+		"ts":          bson.M{"$gt": after},
+		"op":          bson.M{"$in": opCodes},
+		"fromMigrate": bson.M{"$exists": false}}
 	collection := OpLogCollection(session, options)
 	return collection.Find(query).LogReplay().Sort("$natural")
 }
@@ -862,15 +856,14 @@ func opDataReady(op *Op, options *Options) (ready bool) {
 func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Options) error {
 	defer ctx.allWg.Done()
 	s := session.Copy()
-	s.SetCursorTimeout(0) // keep this cursor alive
 	defer s.Close()
-	options.Fill(s)
 	currTimestamp := options.After(s, options)
 	var iter *mgo.Iter
 	var err error
 	sendError := func(err error) {
 		ctx.ErrC <- errors.Wrap(err, "Error tailing oplog entries")
 	}
+	const timeout = time.Duration(3) * time.Second
 seek:
 	for {
 		var entry OpLog
@@ -887,7 +880,7 @@ seek:
 				s.Refresh()
 			}
 		}
-		iter = GetOpLogQuery(s, currTimestamp, options).Tail(-1)
+		iter = GetOpLogQuery(s, currTimestamp, options).Tail(timeout)
 	retry:
 		for iter.Next(&entry) {
 			op := &Op{
@@ -949,6 +942,9 @@ seek:
 					sendError(err)
 				}
 				return nil
+			case ts := <-ctx.seekC:
+				currTimestamp = ts
+				goto seek
 			default:
 				goto retry
 			}
@@ -1181,6 +1177,15 @@ func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *O
 	c := s.DB(n.database).C(n.collection)
 	var pipeline []interface{}
 	var token *bson.Raw
+	/*var startAt bson.MongoTimestamp
+	if options.After != nil {
+		pos := options.After(session, options)
+		if pos > 0 {
+			startAt = pos
+		} else if pos == 0 {
+			startAt = FirstOpTimestamp(session, options)
+		}
+	}*/
 	var connected bool
 	if options.Pipe != nil {
 		var stages []interface{}
@@ -1195,7 +1200,12 @@ func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *O
 restart:
 	for {
 		var stream *mgo.ChangeStream
-		stream, err = c.Watch(pipeline, mgo.ChangeStreamOptions{ResumeAfter: token, FullDocument: "updateLookup"})
+		opts := mgo.ChangeStreamOptions{
+			//StartAtOperationTime: startAt,
+			ResumeAfter:  token,
+			FullDocument: "updateLookup",
+		}
+		stream, err = c.Watch(pipeline, opts)
 		if err != nil {
 			token = nil
 			connected = false
@@ -1220,6 +1230,7 @@ restart:
 				ctx.log.Printf("Resumed watching changes on %s", ns)
 			}
 			connected = true
+			//startAt = 0
 		}
 	retry:
 		var changeDoc ChangeDoc
@@ -1276,6 +1287,11 @@ restart:
 			case <-ctx.stopC:
 				stream.Close()
 				return
+			/*case ts := <-ctx.seekC:
+			startAt = ts
+			token = nil
+			stream.Close()
+			goto restart*/
 			case <-ctx.pauseC:
 				stream.Close()
 				select {
@@ -1293,6 +1309,11 @@ restart:
 			case <-ctx.stopC:
 				stream.Close()
 				return
+			/*case ts := <-ctx.seekC:
+			startAt = ts
+			token = nil
+			stream.Close()
+			goto restart*/
 			default:
 				goto retry
 			}
@@ -1445,11 +1466,11 @@ func OpFilterForOrdering(ordering OrderingGuarantee, workers []string, worker st
 
 func DefaultOptions() *Options {
 	return &Options{
-		After:               nil,
+		After:               LastOpTimestamp,
 		Filter:              nil,
 		NamespaceFilter:     nil,
-		OpLogDatabaseName:   nil,
-		OpLogCollectionName: nil,
+		OpLogDatabaseName:   &defaultOpLogDatabaseName,
+		OpLogCollectionName: &defaultOpLogCollectionName,
 		OpLogDisabled:       false,
 		ChannelSize:         2048,
 		BufferSize:          50,
@@ -1463,20 +1484,6 @@ func DefaultOptions() *Options {
 		Unmarshal:           defaultUnmarshaller,
 		SplitVector:         false,
 		Log:                 log.New(os.Stdout, "INFO ", log.Flags()),
-	}
-}
-
-func (this *Options) Fill(session *mgo.Session) {
-	if this.After == nil {
-		this.After = LastOpTimestamp
-	}
-	if this.OpLogDatabaseName == nil {
-		defaultOpLogDatabaseName := "local"
-		this.OpLogDatabaseName = &defaultOpLogDatabaseName
-	}
-	if this.OpLogCollectionName == nil {
-		defaultOpLogCollectionName := OpLogCollectionName(session, this)
-		this.OpLogCollectionName = &defaultOpLogCollectionName
 	}
 }
 
@@ -1518,6 +1525,15 @@ func (this *Options) SetDefaults() {
 	}
 	if this.DirectReadSplitMax < 1 {
 		this.DirectReadSplitMax = defaultOpts.DirectReadSplitMax
+	}
+	if this.After == nil && len(this.ChangeStreamNs) == 0 {
+		this.After = defaultOpts.After
+	}
+	if this.OpLogDatabaseName == nil {
+		this.OpLogDatabaseName = defaultOpts.OpLogDatabaseName
+	}
+	if this.OpLogCollectionName == nil {
+		this.OpLogCollectionName = defaultOpts.OpLogCollectionName
 	}
 }
 
