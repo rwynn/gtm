@@ -160,7 +160,7 @@ You can wait till all the collections have been fully read by using the DirectRe
 		fmt.Println("direct reads are done")
 	}()
 
-### Pause, Resume, Seek, and Stop ###
+### Pause, Resume, Since, and Stop ###
 
 You can pause, resume, or seek to a timestamp from the oplog. These methods effect only change events and not direct reads.
 
@@ -168,7 +168,7 @@ You can pause, resume, or seek to a timestamp from the oplog. These methods effe
 		ctx.Pause()
                 time.Sleep(time.Duration(2) * time.Minute)
 		ctx.Resume()
-		ctx.Seek(previousTimestamp)
+		ctx.Since(previousTimestamp)
 	}()
 
 You can stop all goroutines created by `Start` or `StartMulti`. You cannot resume a context once it has been stopped. You would need to create a new one.
