@@ -127,12 +127,12 @@ validate your replica set. For local testing your replica set may contain a
 	})
 	// more options are available for tuning
 	ctx := gtm.Start(session, &gtm.Options{
-                NamespaceFilter      nil,           // op filter function that has access to type/ns ONLY
-                Filter               nil,           // op filter function that has access to type/ns/data
-		After:               nil,     	    // if nil defaults to LastOpTimestamp
+		NamespaceFilter      nil,           // op filter function that has access to type/ns ONLY
+		Filter               nil,           // op filter function that has access to type/ns/data
+		After:               nil,     	    // if nil defaults to gtm.LastOpTimestamp; not yet supported for ChangeStreamNS
 		OpLogDisabled:       false,         // true to disable tailing the MongoDB oplog
 		OpLogDatabaseName:   nil,     	    // defaults to "local"
-		OpLogCollectionName: nil,     	    // defaults to a collection prefixed "oplog."
+		OpLogCollectionName: nil,     	    // defaults to "oplog.rs"
 		ChannelSize:         0,       	    // defaults to 20
 		BufferSize:          25,            // defaults to 50. used to batch fetch documents on bursts of activity
 		BufferDuration:      0,             // defaults to 750 ms. after this timeout the batch is force fetched
@@ -145,7 +145,7 @@ validate your replica set. For local testing your replica set may contain a
 		PipeAllowDisk:       false,         // true to allow MongoDB to use disk for aggregation pipeline options with large result sets
 		SplitVector:         false,         // whether or not to use internal MongoDB command split vector to split collections
 		Log:                 myLogger,      // pass your own logger
-		ChangeStreamNs       []string{"db.col1", "db.col2"}, // set to a slice to namespaces to read via MongoDB change streams
+		ChangeStreamNs       []string{"db.col1", "db.col2"}, // MongoDB 3.6+ only; set to a slice to namespaces to read via MongoDB change streams
 	})
 
 ### Direct Reads ###
@@ -159,6 +159,24 @@ You can wait till all the collections have been fully read by using the DirectRe
 		ctx.DirectReadWg.Wait()
 		fmt.Println("direct reads are done")
 	}()
+
+### Pause, Resume, Seek, and Stop ###
+
+You can pause, resume, or seek to a timestamp from the oplog. These methods effect only change events and not direct reads.
+
+	go func() {
+		ctx.Pause()
+                time.Sleep(time.Duration(2) * time.Minute)
+		ctx.Resume()
+		ctx.Seek(previousTimestamp)
+	}()
+
+You can stop all goroutines created by `Start` or `StartMulti`. You cannot resume a context once it has been stopped. You would need to create a new one.
+
+	go func() {
+		ctx.Stop()
+		fmt.Println("all go routines are stopped")
+	}
 
 ### Sharded Clusters ###
 
