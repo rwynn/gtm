@@ -331,6 +331,11 @@ func (shard *ShardInfo) GetURL() string {
 	}
 }
 
+func (ctx *OpCtx) repairSession(session *mgo.Session) *mgo.Session {
+	defer session.Close()
+	return session.Copy()
+}
+
 func (ctx *OpCtx) waitForConnection(wg *sync.WaitGroup, session *mgo.Session, options *Options) {
 	defer wg.Done()
 	t := time.NewTicker(5 * time.Second)
@@ -640,10 +645,11 @@ func (this *OpBuf) HasOne() bool {
 	return len(this.Entries) == 1
 }
 
-func (this *OpBuf) Flush(session *mgo.Session, ctx *OpCtx, options *Options) {
+func (this *OpBuf) Flush(s *mgo.Session, ctx *OpCtx, options *Options) {
 	if len(this.Entries) == 0 {
 		return
 	}
+	session := s.Copy()
 	ns := make(map[string][]interface{})
 	byId := make(map[interface{}][]*Op)
 	for _, op := range this.Entries {
@@ -683,13 +689,15 @@ retry:
 			go ctx.waitForConnection(&wg, session, options)
 			wg.Wait()
 			if ctx.isStopped() {
+				session.Close()
 				this.Entries = nil
 				return
 			}
-			session.Refresh()
+			session = ctx.repairSession(session)
 			goto retry
 		}
 	}
+	session.Close()
 	for _, op := range this.Entries {
 		if op.matchesFilter(options) {
 			ctx.OpC <- op
@@ -856,7 +864,6 @@ func opDataReady(op *Op, options *Options) (ready bool) {
 func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Options) error {
 	defer ctx.allWg.Done()
 	s := session.Copy()
-	defer s.Close()
 	currTimestamp := options.After(s, options)
 	var iter *mgo.Iter
 	var err error
@@ -875,9 +882,10 @@ seek:
 				go ctx.waitForConnection(&wg, s, options)
 				wg.Wait()
 				if ctx.isStopped() {
+					s.Close()
 					return nil
 				}
-				s.Refresh()
+				s = ctx.repairSession(s)
 			}
 		}
 		iter = GetOpLogQuery(s, currTimestamp, options).Tail(timeout)
@@ -911,6 +919,7 @@ seek:
 				if err = iter.Close(); err != nil {
 					sendError(err)
 				}
+				s.Close()
 				return nil
 			case ts := <-ctx.seekC:
 				currTimestamp = ts
@@ -929,6 +938,7 @@ seek:
 					if err = iter.Close(); err != nil {
 						sendError(err)
 					}
+					s.Close()
 					return nil
 				}
 			default:
@@ -941,6 +951,7 @@ seek:
 				if err = iter.Close(); err != nil {
 					sendError(err)
 				}
+				s.Close()
 				return nil
 			case ts := <-ctx.seekC:
 				currTimestamp = ts
@@ -950,12 +961,15 @@ seek:
 			}
 		}
 	}
+	s.Close()
 	return nil
 }
 
 func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (err error) {
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
+	s := session.Copy()
+	defer s.Close()
 	doPagedRead := func() {
 		ctx.allWg.Add(1)
 		ctx.DirectReadWg.Add(1)
@@ -967,8 +981,8 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 		return
 	}
 	var stats *CollectionStats
-	stats, _ = GetCollectionStats(ctx, session, ns)
-	col := session.DB(n.database).C(n.collection)
+	stats, _ = GetCollectionStats(ctx, s, ns)
+	col := s.DB(n.database).C(n.collection)
 	indexes, err := col.Indexes()
 	if err != nil {
 		msg := fmt.Sprintf("Unable to determine indexes on %s for direct read split vector", ns)
@@ -1008,7 +1022,7 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 				MaxSplitPoints: maxSplits,
 			}
 			var result SplitVectorResult
-			err = session.Run(splitv, &result)
+			err = s.Run(splitv, &result)
 			if err != nil || result.Ok == 0 {
 				msg := fmt.Sprintf("Split Vector admin command failed for key pattern %s in namespace %s", ns, key)
 				ctx.ErrC <- errors.Wrap(err, msg)
@@ -1027,6 +1041,7 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 	}
 	if splitMax < splitMin {
 		doPagedRead()
+		return
 	} else {
 		ctx.log.Printf("Found %d splits (%d segments) for namespace %s using index on %s", splitMax, splitMax+1, ns, bestSplit.splitKey)
 		bestSplit.divide()
@@ -1038,6 +1053,7 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 			}
 		} else {
 			doPagedRead()
+			return
 		}
 	}
 	return
@@ -1069,7 +1085,6 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 	defer ctx.DirectReadWg.Done()
 	s := session.Copy()
 	s.SetMode(mgo.Nearest, true)
-	defer s.Close()
 	n := &N{}
 	if err = n.parse(ns); err != nil {
 		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
@@ -1083,6 +1098,7 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 			batch = 0
 		}
 	}
+restart:
 	var iter *mgo.Iter
 	c := s.DB(n.database).C(n.collection)
 	sel := seg.toSelector()
@@ -1095,6 +1111,7 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 		var pipeline []interface{}
 		if pipeline, err = options.Pipe(ns, false); err != nil {
 			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline stages.")
+			s.Close()
 			return
 		}
 		if pipeline != nil {
@@ -1135,6 +1152,7 @@ retry:
 		select {
 		case <-ctx.stopC:
 			iter.Close()
+			s.Close()
 			return
 		default:
 			continue
@@ -1144,6 +1162,7 @@ retry:
 		select {
 		case <-ctx.stopC:
 			iter.Close()
+			s.Close()
 			return
 		default:
 			goto retry
@@ -1156,25 +1175,24 @@ retry:
 		go ctx.waitForConnection(&wg, s, options)
 		wg.Wait()
 		if ctx.isStopped() {
+			s.Close()
 			return
 		}
-		ctx.allWg.Add(1)
-		ctx.DirectReadWg.Add(1)
-		go DirectReadSegment(ctx, session, ns, options, seg, stats)
+		s = ctx.repairSession(s)
+		goto restart
 	}
+	s.Close()
 	return
 }
 
 func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (err error) {
 	defer ctx.allWg.Done()
 	s := session.Copy()
-	defer s.Close()
 	n := &N{}
 	if err = n.parse(ns); err != nil {
 		ctx.ErrC <- errors.Wrap(err, "Error consuming change stream. Invalid namespace.")
 		return
 	}
-	c := s.DB(n.database).C(n.collection)
 	var pipeline []interface{}
 	var token *bson.Raw
 	/*var startAt bson.MongoTimestamp
@@ -1205,6 +1223,7 @@ restart:
 			ResumeAfter:  token,
 			FullDocument: "updateLookup",
 		}
+		c := s.DB(n.database).C(n.collection)
 		stream, err = c.Watch(pipeline, opts)
 		if err != nil {
 			token = nil
@@ -1218,9 +1237,10 @@ restart:
 			go ctx.waitForConnection(&wg, s, options)
 			wg.Wait()
 			if ctx.isStopped() {
+				s.Close()
 				return
 			}
-			s.Refresh()
+			s = ctx.repairSession(s)
 			goto restart
 		}
 		if !connected {
@@ -1286,6 +1306,7 @@ restart:
 			select {
 			case <-ctx.stopC:
 				stream.Close()
+				s.Close()
 				return
 			/*case ts := <-ctx.seekC:
 			startAt = ts
@@ -1298,6 +1319,7 @@ restart:
 				case <-ctx.resumeC:
 					goto restart
 				case <-ctx.stopC:
+					s.Close()
 					return
 				}
 			default:
@@ -1308,6 +1330,7 @@ restart:
 			select {
 			case <-ctx.stopC:
 				stream.Close()
+				s.Close()
 				return
 			/*case ts := <-ctx.seekC:
 			startAt = ts
@@ -1326,11 +1349,14 @@ restart:
 			go ctx.waitForConnection(&wg, s, options)
 			wg.Wait()
 			if ctx.isStopped() {
+				s.Close()
 				return
 			}
-			s.Refresh()
+			s = ctx.repairSession(s)
 		}
 	}
+	s.Close()
+	return nil
 }
 
 func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (err error) {
@@ -1397,8 +1423,6 @@ func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Optio
 
 func FetchDocuments(ctx *OpCtx, session *mgo.Session, filter OpFilter, buf *OpBuf, inOp OpChan, options *Options) error {
 	defer ctx.allWg.Done()
-	s := session.Copy()
-	defer s.Close()
 	timer := time.NewTimer(buf.BufferDuration)
 	timer.Stop()
 	for {
@@ -1406,7 +1430,7 @@ func FetchDocuments(ctx *OpCtx, session *mgo.Session, filter OpFilter, buf *OpBu
 		case <-ctx.stopC:
 			return nil
 		case <-timer.C:
-			buf.Flush(s, ctx, options)
+			buf.Flush(session, ctx, options)
 		case op := <-inOp:
 			if op == nil {
 				break
@@ -1415,7 +1439,7 @@ func FetchDocuments(ctx *OpCtx, session *mgo.Session, filter OpFilter, buf *OpBu
 				buf.Append(op)
 				if buf.IsFull() {
 					timer.Stop()
-					buf.Flush(s, ctx, options)
+					buf.Flush(session, ctx, options)
 				} else if buf.HasOne() {
 					if !timer.Stop() {
 						select {
