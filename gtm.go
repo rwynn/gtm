@@ -1084,7 +1084,6 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
 	s := session.Copy()
-	s.SetMode(mgo.Nearest, true)
 	n := &N{}
 	if err = n.parse(ns); err != nil {
 		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
