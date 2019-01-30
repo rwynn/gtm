@@ -870,7 +870,7 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 	sendError := func(err error) {
 		ctx.ErrC <- errors.Wrap(err, "Error tailing oplog entries")
 	}
-	const timeout = time.Duration(3) * time.Second
+	const timeout = time.Duration(10) * time.Second
 seek:
 	for {
 		var entry OpLog
