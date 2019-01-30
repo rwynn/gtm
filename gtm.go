@@ -1219,8 +1219,9 @@ restart:
 		var stream *mgo.ChangeStream
 		opts := mgo.ChangeStreamOptions{
 			//StartAtOperationTime: startAt,
-			ResumeAfter:  token,
-			FullDocument: "updateLookup",
+			ResumeAfter:    token,
+			FullDocument:   "updateLookup",
+			MaxAwaitTimeMS: time.Duration(10) * time.Second,
 		}
 		c := s.DB(n.database).C(n.collection)
 		stream, err = c.Watch(pipeline, opts)
