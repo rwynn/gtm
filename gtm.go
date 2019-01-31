@@ -48,6 +48,7 @@ type Options struct {
 	BufferDuration      time.Duration
 	Ordering            OrderingGuarantee
 	WorkerCount         int
+	MaxWaitSecs         int
 	UpdateDataAsDelta   bool
 	ChangeStreamNs      []string
 	DirectReadNs        []string
@@ -870,7 +871,7 @@ func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Optio
 	sendError := func(err error) {
 		ctx.ErrC <- errors.Wrap(err, "Error tailing oplog entries")
 	}
-	const timeout = time.Duration(10) * time.Second
+	timeout := time.Duration(options.MaxWaitSecs) * time.Second
 seek:
 	for {
 		var entry OpLog
@@ -1113,7 +1114,7 @@ restart:
 			s.Close()
 			return
 		}
-		if pipeline != nil {
+		if pipeline != nil && len(pipeline) > 0 {
 			var stages []interface{}
 			stages = append(stages, bson.M{"$match": sel})
 			for _, stage := range pipeline {
@@ -1122,6 +1123,9 @@ restart:
 			pipe := c.Pipe(stages)
 			if options.PipeAllowDisk {
 				pipe = pipe.AllowDiskUse()
+			}
+			if batch != 0 {
+				pipe = pipe.Batch(int(batch))
 			}
 			iter = pipe.Iter()
 		}
@@ -1221,7 +1225,7 @@ restart:
 			//StartAtOperationTime: startAt,
 			ResumeAfter:    token,
 			FullDocument:   "updateLookup",
-			MaxAwaitTimeMS: time.Duration(10) * time.Second,
+			MaxAwaitTimeMS: time.Duration(options.MaxWaitSecs) * time.Second,
 		}
 		c := s.DB(n.database).C(n.collection)
 		stream, err = c.Watch(pipeline, opts)
@@ -1501,6 +1505,7 @@ func DefaultOptions() *Options {
 		BufferDuration:      time.Duration(75) * time.Millisecond,
 		Ordering:            Oplog,
 		WorkerCount:         10,
+		MaxWaitSecs:         10,
 		UpdateDataAsDelta:   false,
 		DirectReadNs:        []string{},
 		DirectReadFilter:    nil,
@@ -1558,6 +1563,9 @@ func (this *Options) SetDefaults() {
 	}
 	if this.OpLogCollectionName == nil {
 		this.OpLogCollectionName = defaultOpts.OpLogCollectionName
+	}
+	if this.MaxWaitSecs == 0 {
+		this.MaxWaitSecs = defaultOpts.MaxWaitSecs
 	}
 }
 
