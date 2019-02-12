@@ -97,14 +97,23 @@ type SplitVectorRequest struct {
 	Force          bool        "force"
 }
 
+type ChangeDocNs struct {
+	Database   string "db"
+	Collection string "coll"
+}
+
 type ChangeDoc struct {
 	DocKey            map[string]interface{} "documentKey"
 	Id                interface{}            "_id"
 	Operation         string                 "operationType"
 	FullDoc           *bson.Raw              "fullDocument"
-	Namespace         map[string]string      "ns"
+	Namespace         ChangeDocNs            "ns"
 	Timestamp         bson.MongoTimestamp    "clusterTime"
 	UpdateDescription *bson.Raw              "updateDescription"
+}
+
+type watchable interface {
+	Watch(pipeline interface{}, options mgo.ChangeStreamOptions) (*mgo.ChangeStream, error)
 }
 
 func (cd *ChangeDoc) docId() interface{} {
@@ -128,7 +137,7 @@ func (cd *ChangeDoc) mapOperation() string {
 		return "u"
 	} else if cd.Operation == "delete" {
 		return "d"
-	} else if cd.Operation == "invalidate" {
+	} else if cd.Operation == "invalidate" || cd.Operation == "drop" || cd.Operation == "dropDatabase" {
 		return "c"
 	} else {
 		return ""
@@ -147,8 +156,20 @@ func (cd *ChangeDoc) isInvalidate() bool {
 	return cd.Operation == "invalidate"
 }
 
+func (cd *ChangeDoc) isDrop() bool {
+	return cd.Operation == "drop"
+}
+
+func (cd *ChangeDoc) isDropDatabase() bool {
+	return cd.Operation == "dropDatabase"
+}
+
 func (cd *ChangeDoc) mapNs() string {
-	return cd.Namespace["db"] + "." + cd.Namespace["coll"]
+	if cd.Namespace.Collection != "" {
+		return cd.Namespace.Database + "." + cd.Namespace.Collection
+	} else {
+		return cd.Namespace.Database + ".cmd"
+	}
 }
 
 type Doc struct {
@@ -321,6 +342,47 @@ func (n *N) parse(ns string) (err error) {
 		n.collection = parts[1]
 	}
 	return
+}
+
+func (n *N) parseForChanges(ns string) {
+	if ns == "" {
+		// watch the whole deployment
+		n.database = ""
+		n.collection = ""
+		return
+	}
+	parts := strings.SplitN(ns, ".", 2)
+	if len(parts) == 1 {
+		n.database = parts[0]
+		n.collection = ""
+	} else {
+		n.database = parts[0]
+		n.collection = parts[1]
+	}
+	return
+}
+
+func (n *N) desc() (dsc string) {
+	if n.isDatabase() {
+		dsc = fmt.Sprintf("database %s", n.database)
+	} else if n.isCollection() {
+		dsc = fmt.Sprintf("collection %s.%s", n.database, n.collection)
+	} else {
+		dsc = "the deployment"
+	}
+	return
+}
+
+func (n *N) isDeployment() bool {
+	return n.database == "" && n.collection == ""
+}
+
+func (n *N) isDatabase() bool {
+	return n.database != "" && n.collection == ""
+}
+
+func (n *N) isCollection() bool {
+	return n.database != "" && n.collection != ""
 }
 
 func (shard *ShardInfo) GetURL() string {
@@ -1192,13 +1254,10 @@ func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *O
 	defer ctx.allWg.Done()
 	s := session.Copy()
 	n := &N{}
-	if err = n.parse(ns); err != nil {
-		ctx.ErrC <- errors.Wrap(err, "Error consuming change stream. Invalid namespace.")
-		return
-	}
+	n.parseForChanges(ns)
 	var pipeline []interface{}
 	var token *bson.Raw
-	/*var startAt bson.MongoTimestamp
+	var startAt bson.MongoTimestamp
 	if options.After != nil {
 		pos := options.After(session, options)
 		if pos > 0 {
@@ -1206,8 +1265,8 @@ func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *O
 		} else if pos == 0 {
 			startAt = FirstOpTimestamp(session, options)
 		}
-	}*/
-	var connected bool
+	}
+	var connected, invalidated bool
 	if options.Pipe != nil {
 		var stages []interface{}
 		if stages, err = options.Pipe(ns, true); err != nil {
@@ -1222,19 +1281,29 @@ restart:
 	for {
 		var stream *mgo.ChangeStream
 		opts := mgo.ChangeStreamOptions{
-			//StartAtOperationTime: startAt,
-			ResumeAfter:    token,
-			FullDocument:   "updateLookup",
-			MaxAwaitTimeMS: time.Duration(options.MaxWaitSecs) * time.Second,
+			StartAtOperationTime: startAt,
+			ResumeAfter:          token,
+			FullDocument:         "updateLookup",
+			MaxAwaitTimeMS:       time.Duration(options.MaxWaitSecs) * time.Second,
 		}
-		c := s.DB(n.database).C(n.collection)
-		stream, err = c.Watch(pipeline, opts)
+		var target watchable
+		if n.isDeployment() {
+			target = s
+		} else if n.isDatabase() {
+			target = s.DB(n.database)
+		} else {
+			target = s.DB(n.database).C(n.collection)
+		}
+		stream, err = target.Watch(pipeline, opts)
 		if err != nil {
 			token = nil
 			connected = false
 			ctx.ErrC <- errors.Wrap(err, "Error starting change stream. Will retry.")
 			if stream != nil {
 				stream.Close()
+			}
+			if invalidated {
+				time.Sleep(time.Duration(5) * time.Second)
 			}
 			var wg sync.WaitGroup
 			wg.Add(1)
@@ -1247,42 +1316,59 @@ restart:
 			s = ctx.repairSession(s)
 			goto restart
 		}
+		invalidated = false
 		if !connected {
-			if token == nil {
-				ctx.log.Printf("Started watching changes on %s", ns)
+			if token == nil && startAt == 0 {
+				ctx.log.Printf("Started watching changes on %s", n.desc())
 			} else {
-				ctx.log.Printf("Resumed watching changes on %s", ns)
+				ctx.log.Printf("Resumed watching changes on %s", n.desc())
 			}
 			connected = true
-			//startAt = 0
+			startAt = 0
 		}
 	retry:
 		var changeDoc ChangeDoc
 		for stream.Next(&changeDoc) {
 			token = stream.ResumeToken()
-			if changeDoc.isInvalidate() {
+			oper := changeDoc.mapOperation()
+			if changeDoc.isDrop() {
 				op := &Op{
-					Operation: changeDoc.mapOperation(),
-					Namespace: ns,
+					Operation: oper,
+					Namespace: changeDoc.mapNs(),
 					Source:    OplogQuerySource,
 					Timestamp: changeDoc.mapTimestamp(),
 				}
 				op.Data = map[string]interface{}{"drop": n.collection}
-				ctx.OpC <- op
+				if op.matchesNsFilter(options) {
+					ctx.OpC <- op
+				}
+			} else if changeDoc.isDropDatabase() {
+				op := &Op{
+					Operation: oper,
+					Namespace: changeDoc.mapNs(),
+					Source:    OplogQuerySource,
+					Timestamp: changeDoc.mapTimestamp(),
+				}
+				op.Data = map[string]interface{}{"dropDatabase": n.database}
+				if op.matchesNsFilter(options) {
+					ctx.OpC <- op
+				}
+			} else if changeDoc.isInvalidate() {
+				invalidated = true
+				connected = false
 				token = nil
 				stream.Close()
 				time.Sleep(time.Duration(5) * time.Second)
 				goto restart
-			} else {
-				kind := changeDoc.mapOperation()
-				if kind != "" {
-					op := &Op{
-						Id:        changeDoc.docId(),
-						Operation: kind,
-						Namespace: ns,
-						Source:    OplogQuerySource,
-						Timestamp: changeDoc.mapTimestamp(),
-					}
+			} else if oper != "" {
+				op := &Op{
+					Id:        changeDoc.docId(),
+					Operation: oper,
+					Namespace: changeDoc.mapNs(),
+					Source:    OplogQuerySource,
+					Timestamp: changeDoc.mapTimestamp(),
+				}
+				if op.matchesNsFilter(options) {
 					if changeDoc.hasUpdate() {
 						var udm map[string]interface{}
 						ud := changeDoc.UpdateDescription
@@ -1300,10 +1386,8 @@ restart:
 						} else {
 							ctx.ErrC <- err
 						}
-					} else {
-						if op.matchesDirectFilter(options) {
-							ctx.OpC <- op
-						}
+					} else if op.matchesDirectFilter(options) {
+						ctx.OpC <- op
 					}
 				}
 			}
@@ -1312,13 +1396,15 @@ restart:
 				stream.Close()
 				s.Close()
 				return
-			/*case ts := <-ctx.seekC:
-			startAt = ts
-			token = nil
-			stream.Close()
-			goto restart*/
+			case ts := <-ctx.seekC:
+				startAt = ts
+				token = nil
+				connected = false
+				stream.Close()
+				goto restart
 			case <-ctx.pauseC:
 				stream.Close()
+				connected = false
 				select {
 				case <-ctx.resumeC:
 					goto restart
@@ -1336,11 +1422,12 @@ restart:
 				stream.Close()
 				s.Close()
 				return
-			/*case ts := <-ctx.seekC:
-			startAt = ts
-			token = nil
-			stream.Close()
-			goto restart*/
+			case ts := <-ctx.seekC:
+				startAt = ts
+				token = nil
+				connected = false
+				stream.Close()
+				goto restart
 			default:
 				goto retry
 			}
