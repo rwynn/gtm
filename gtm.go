@@ -1266,7 +1266,7 @@ func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *O
 			startAt = FirstOpTimestamp(session, options)
 		}
 	}
-	var connected, invalidated bool
+	var invalidated bool
 	if options.Pipe != nil {
 		var stages []interface{}
 		if stages, err = options.Pipe(ns, true); err != nil {
@@ -1297,7 +1297,6 @@ restart:
 		stream, err = target.Watch(pipeline, opts)
 		if err != nil {
 			token = nil
-			connected = false
 			ctx.ErrC <- errors.Wrap(err, "Error starting change stream. Will retry.")
 			if stream != nil {
 				stream.Close()
@@ -1317,18 +1316,11 @@ restart:
 			goto restart
 		}
 		invalidated = false
-		if !connected {
-			if token == nil && startAt == 0 {
-				ctx.log.Printf("Started watching changes on %s", n.desc())
-			} else {
-				ctx.log.Printf("Resumed watching changes on %s", n.desc())
-			}
-			connected = true
-			startAt = 0
-		}
+		ctx.log.Printf("Watching changes on %s", n.desc())
 	retry:
 		var changeDoc ChangeDoc
 		for stream.Next(&changeDoc) {
+			startAt = 0
 			token = stream.ResumeToken()
 			oper := changeDoc.mapOperation()
 			if changeDoc.isDrop() {
@@ -1355,7 +1347,6 @@ restart:
 				}
 			} else if changeDoc.isInvalidate() {
 				invalidated = true
-				connected = false
 				token = nil
 				stream.Close()
 				time.Sleep(time.Duration(5) * time.Second)
@@ -1399,12 +1390,10 @@ restart:
 			case ts := <-ctx.seekC:
 				startAt = ts
 				token = nil
-				connected = false
 				stream.Close()
 				goto restart
 			case <-ctx.pauseC:
 				stream.Close()
-				connected = false
 				select {
 				case <-ctx.resumeC:
 					goto restart
@@ -1425,7 +1414,6 @@ restart:
 			case ts := <-ctx.seekC:
 				startAt = ts
 				token = nil
-				connected = false
 				stream.Close()
 				goto restart
 			default:
@@ -1433,7 +1421,6 @@ restart:
 			}
 		}
 		if err = stream.Close(); err != nil {
-			connected = false
 			ctx.ErrC <- errors.Wrap(err, "Error consuming change stream. Will retry.")
 			var wg sync.WaitGroup
 			wg.Add(1)
