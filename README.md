@@ -25,7 +25,8 @@ validate your replica set. For local testing your replica set may contain a
 [single member](https://docs.mongodb.com/manual/tutorial/convert-standalone-to-replica-set/).
 
 ### Usage ###
-	
+
+```golang
 	package main
 	
 	import "github.com/globalsign/mgo"
@@ -77,8 +78,11 @@ validate your replica set. For local testing your replica set may contain a
 			}
 		}
 	}
+```
 
 ### Configuration ###
+
+```golang
 
 	func PipeBuilder(namespace string, changeStream bool) ([]interface{}, error) {
 
@@ -147,6 +151,7 @@ validate your replica set. For local testing your replica set may contain a
 		Log:                 myLogger,      // pass your own logger
 		ChangeStreamNs       []string{"db.col1", "db.col2"}, // MongoDB 3.6+ only; set to a slice to namespaces to read via MongoDB change streams
 	})
+```
 
 ### Direct Reads ###
 
@@ -155,28 +160,35 @@ to a slice of MongoDB namespaces.  Documents from these collections will be read
 
 You can wait till all the collections have been fully read by using the DirectReadWg wait group on the ctx.
 
+```golang
 	go func() {
 		ctx.DirectReadWg.Wait()
 		fmt.Println("direct reads are done")
 	}()
+```
 
 ### Pause, Resume, Since, and Stop ###
 
 You can pause, resume, or seek to a timestamp from the oplog. These methods effect only change events and not direct reads.
 
+```golang
 	go func() {
 		ctx.Pause()
                 time.Sleep(time.Duration(2) * time.Minute)
 		ctx.Resume()
 		ctx.Since(previousTimestamp)
 	}()
+```
 
 You can stop all goroutines created by `Start` or `StartMulti`. You cannot resume a context once it has been stopped. You would need to create a new one.
+
+```golang
 
 	go func() {
 		ctx.Stop()
 		fmt.Println("all go routines are stopped")
 	}
+```
 
 ### Sharded Clusters ###
 
@@ -185,6 +197,7 @@ If you use `ChangeStreamNs` on MongoDB 3.6+ you can ignore this section.  Native
 
 gtm has support for sharded MongoDB clusters.  You will want to start with a connection to the MongoDB config server to get the list of available shards.
 
+```golang
     // assuming the CONFIG server for a sharded cluster is running locally on port 27018
     configSession, err = mgo.Dial("127.0.0.1:27018")
     if err != nil {
@@ -192,8 +205,11 @@ gtm has support for sharded MongoDB clusters.  You will want to start with a con
     }
     // get the list of shard servers
     shardInfos := gtm.GetShards(configSession)
+```
 
 for each shard you will create a session and append it to a slice of sessions
+
+```golang
 
     var shardSessions []*mgo.Session
     // add each shard server to the sync list
@@ -206,17 +222,21 @@ for each shard you will create a session and append it to a slice of sessions
         }
         shardSessions = append(shardSessions, shard)
     }
+```
 
 finally you will want to start a multi context.  The multi context behaves just like a single
 context except that it tails multiple shard servers and coalesces the events to a single output
 channel
 
+```golang
 	multiCtx := gtm.StartMulti(shardSessions, nil)
+```
 
 after you have created the multi context for all the shards you can handle new shards being added
 to the cluster at some later time by adding a listener. You will want to add this listener before 
 you enter a loop to read events from the multi context.
 
+```golang
 	insertHandler := func(shardInfo *gtm.ShardInfo) (*mgo.Session, error) {
 		log.Printf("Adding shard found at %s\n", shardInfo.GetURL())
         shardURL := shardInfo.GetURL()
@@ -224,12 +244,14 @@ you enter a loop to read events from the multi context.
 	}
 
 	multiCtx.AddShardListener(configSession, nil, insertHandler)
+```
 
 ### Custom Unmarshalling ###
 
 If you'd like to unmarshall MongoDB documents into your own struct instead of the document getting
 unmarshalled to a generic map[string]interface{} you can use a custom unmarshal function:
 
+```golang
 	type MyDoc struct {
 		Id interface{} "_id"
 		Foo string "foo"
@@ -261,6 +283,7 @@ unmarshalled to a generic map[string]interface{} you can use a custom unmarshal 
 			}
 		}
 	}
+```
 
 ### Workers ###
 
@@ -269,12 +292,15 @@ To do this you can leverage the **github.com/rwynn/gtm/consistent** package.
 
 Create a TOML document containing a list of all the event handlers.
 
+```toml
 	Workers = [ "Tom", "Dick", "Harry" ] 
+```
 
 Create a consistent filter to distribute the work between Tom, Dick, and Harry. A consistent filter
 needs to acces the Data attribute of each op so it needs to be set as a Filter as opposed to a 
 NamespaceFilter.
-	
+
+```golang
 	name := flag.String("name", "", "the name of this worker")
 	flag.Parse()
 	filter, filterErr := consistent.ConsistentHashFilterFromFile(*name, "/path/to/toml")
@@ -285,14 +311,19 @@ NamespaceFilter.
 	// there is also a method **consistent.ConsistentHashFilterFromDocument** which allows
 	// you to pass a Mongo document representing the config if you would like to avoid
 	// copying the same config file to multiple servers
+```
 
 Pass the filter into the options when calling gtm.Tail
 
+```golang
 	ctx := gtm.Start(session, &gtm.Options{Filter: filter})
+```
 
 If you have your multiple filters you can use the gtm utility method ChainOpFilters
-	
+
+```golang
 	func ChainOpFilters(filters ...OpFilter) OpFilter
+```
 
 ### Optimizing Direct Read Throughput with SplitVector enabled ###
 
