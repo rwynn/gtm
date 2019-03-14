@@ -17,7 +17,7 @@ var EmptyWorkers = errors.New("config not found or workers empty")
 var InvalidWorkers = errors.New("workers must be an array of string")
 var WorkerMissing = errors.New("the specified worker was not found in the config")
 
-// returns an operation filter which uses a consistent hash to determine
+// ConsistentHashFilterFromFile returns an operation filter which uses a consistent hash to determine
 // if the operation will be accepted for processing. can be used to distribute work.
 // name:	the name of the worker creating this filter. e.g. "Harry"
 // configFile:	a file path to a TOML document.  the document should contain
@@ -32,7 +32,7 @@ func ConsistentHashFilterFromFile(name string, configFile string) (gtm.OpFilter,
 	}
 }
 
-// returns an operation filter which uses a consistent hash to determine
+// ConsistentHashFilterFromDocument returns an operation filter which uses a consistent hash to determine
 // if the operation will be accepted for processing. can be used to distribute work.
 // name:	the name of the worker creating this filter. e.g. "Harry"
 // document:	a map with a string key 'workers' which has a corresponding
@@ -42,7 +42,7 @@ func ConsistentHashFilterFromDocument(name string, document map[string]interface
 	return ConsistentHashFilter(name, workers.([]string))
 }
 
-// returns an operation filter which uses a consistent hash to determine
+// ConsistentHashFilter returns an operation filter which uses a consistent hash to determine
 // if the operation will be accepted for processing. can be used to distribute work.
 // name:	the name of the worker creating this filter. e.g. "Harry"
 // workers:	a slice of strings representing the available worker names
