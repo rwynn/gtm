@@ -54,6 +54,7 @@ type Options struct {
 	DirectReadNs        []string
 	DirectReadFilter    OpFilter
 	DirectReadSplitMax  int
+	DirectReadConcur    int
 	Unmarshal           DataUnmarshaller
 	Pipe                PipelineBuilder
 	PipeAllowDisk       bool
@@ -272,19 +273,20 @@ type OpBuf struct {
 }
 
 type OpCtx struct {
-	lock         *sync.Mutex
-	OpC          OpChan
-	ErrC         chan error
-	DirectReadWg *sync.WaitGroup
-	stopC        chan bool
-	allWg        *sync.WaitGroup
-	seekC        chan bson.MongoTimestamp
-	pauseC       chan bool
-	resumeC      chan bool
-	paused       bool
-	stopped      bool
-	log          *log.Logger
-	streams      int
+	lock             *sync.Mutex
+	OpC              OpChan
+	ErrC             chan error
+	DirectReadWg     *sync.WaitGroup
+	directReadConcWg *sync.WaitGroup
+	stopC            chan bool
+	allWg            *sync.WaitGroup
+	seekC            chan bson.MongoTimestamp
+	pauseC           chan bool
+	resumeC          chan bool
+	paused           bool
+	stopped          bool
+	log              *log.Logger
+	streams          int
 }
 
 type OpCtxMulti struct {
@@ -1031,11 +1033,13 @@ seek:
 func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (err error) {
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
+	defer ctx.directReadConcWg.Done()
 	s := session.Copy()
 	defer s.Close()
 	doPagedRead := func() {
 		ctx.allWg.Add(1)
 		ctx.DirectReadWg.Add(1)
+		ctx.directReadConcWg.Add(1)
 		go DirectReadPaged(ctx, session, ns, options)
 	}
 	n := &N{}
@@ -1058,6 +1062,13 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 	splitMin = 4
 	bestSplit := &CollectionSegment{
 		splitKey: "_id",
+	}
+	if maxSplits <= 0 {
+		ctx.allWg.Add(1)
+		ctx.DirectReadWg.Add(1)
+		ctx.directReadConcWg.Add(1)
+		go DirectReadSegment(ctx, session, ns, options, bestSplit, stats)
+		return
 	}
 	for _, index := range indexes {
 		key := strings.TrimPrefix(index.Key[0], "-")
@@ -1112,6 +1123,7 @@ func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options 
 			for _, subseg := range bestSplit.subSegments {
 				ctx.allWg.Add(1)
 				ctx.DirectReadWg.Add(1)
+				ctx.directReadConcWg.Add(1)
 				go DirectReadSegment(ctx, session, ns, options, subseg, stats)
 			}
 		} else {
@@ -1146,6 +1158,7 @@ func GetCollectionStats(ctx *OpCtx, session *mgo.Session, ns string) (stats *Col
 func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Options, seg *CollectionSegment, stats *CollectionStats) (err error) {
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
+	defer ctx.directReadConcWg.Done()
 	s := session.Copy()
 	n := &N{}
 	if err = n.parse(ns); err != nil {
@@ -1247,6 +1260,29 @@ retry:
 		goto restart
 	}
 	s.Close()
+	return
+}
+
+func ProcessDirectReads(ctx *OpCtx, session *mgo.Session, options *Options) (err error) {
+	defer ctx.allWg.Done()
+	defer ctx.DirectReadWg.Done()
+	concur := options.DirectReadConcur
+	running := 0
+	for _, ns := range options.DirectReadNs {
+		if concur > 0 && running >= concur {
+			ctx.directReadConcWg.Wait()
+			running = 0
+		}
+		ctx.DirectReadWg.Add(1)
+		ctx.directReadConcWg.Add(1)
+		ctx.allWg.Add(1)
+		if options.SplitVector {
+			go DirectReadSplitVector(ctx, session, ns, options)
+		} else {
+			go DirectReadPaged(ctx, session, ns, options)
+		}
+		running = running + 1
+	}
 	return
 }
 
@@ -1440,6 +1476,7 @@ restart:
 func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (err error) {
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
+	defer ctx.directReadConcWg.Done()
 	s := session.Copy()
 	defer s.Close()
 	n := &N{}
@@ -1452,15 +1489,22 @@ func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Optio
 	c := s.DB(n.database).C(n.collection)
 	const defaultSegmentSize = 50000
 	var maxSplits = options.DirectReadSplitMax
+	segment := &CollectionSegment{
+		splitKey: "_id",
+	}
+	if maxSplits <= 0 {
+		ctx.allWg.Add(1)
+		ctx.DirectReadWg.Add(1)
+		ctx.directReadConcWg.Add(1)
+		go DirectReadSegment(ctx, session, ns, options, segment, stats)
+		return
+	}
 	var segmentSize int = defaultSegmentSize
 	if stats.Count != 0 {
 		segmentSize = int(stats.Count) / (maxSplits + 1)
 		if segmentSize < defaultSegmentSize {
 			segmentSize = defaultSegmentSize
 		}
-	}
-	segment := &CollectionSegment{
-		splitKey: "_id",
 	}
 	var doc Doc
 	var splitCount int
@@ -1481,6 +1525,7 @@ func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Optio
 		}
 		ctx.allWg.Add(1)
 		ctx.DirectReadWg.Add(1)
+		ctx.directReadConcWg.Add(1)
 		go DirectReadSegment(ctx, session, ns, options, segment, stats)
 		if !done {
 			segment = &CollectionSegment{
@@ -1492,6 +1537,7 @@ func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Optio
 				done = true
 				ctx.allWg.Add(1)
 				ctx.DirectReadWg.Add(1)
+				ctx.directReadConcWg.Add(1)
 				go DirectReadSegment(ctx, session, ns, options, segment, stats)
 			}
 		}
@@ -1584,6 +1630,7 @@ func DefaultOptions() *Options {
 		DirectReadNs:        []string{},
 		DirectReadFilter:    nil,
 		DirectReadSplitMax:  9,
+		DirectReadConcur:    0,
 		Unmarshal:           defaultUnmarshaller,
 		SplitVector:         false,
 		Log:                 log.New(os.Stdout, "INFO ", log.Flags()),
@@ -1626,7 +1673,10 @@ func (this *Options) SetDefaults() {
 	if this.Log == nil {
 		this.Log = defaultOpts.Log
 	}
-	if this.DirectReadSplitMax < 1 {
+	if this.DirectReadConcur == 0 {
+		this.DirectReadConcur = defaultOpts.DirectReadConcur
+	}
+	if this.DirectReadSplitMax == 0 {
 		this.DirectReadSplitMax = defaultOpts.DirectReadSplitMax
 	}
 	if this.After == nil && len(this.ChangeStreamNs) == 0 {
@@ -1751,6 +1801,7 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 	var inOps []OpChan
 	var workerNames []string
 	var directReadWg sync.WaitGroup
+	var directReadConcWg sync.WaitGroup
 	var allWg sync.WaitGroup
 	streams := len(options.ChangeStreamNs)
 	if options.OpLogDisabled == false {
@@ -1761,17 +1812,18 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 	var resumeC = make(chan bool, streams)
 
 	ctx := &OpCtx{
-		lock:         &sync.Mutex{},
-		OpC:          opC,
-		ErrC:         errC,
-		DirectReadWg: &directReadWg,
-		stopC:        stopC,
-		allWg:        &allWg,
-		pauseC:       pauseC,
-		resumeC:      resumeC,
-		seekC:        seekC,
-		log:          options.Log,
-		streams:      streams,
+		lock:             &sync.Mutex{},
+		OpC:              opC,
+		ErrC:             errC,
+		DirectReadWg:     &directReadWg,
+		directReadConcWg: &directReadConcWg,
+		stopC:            stopC,
+		allWg:            &allWg,
+		pauseC:           pauseC,
+		resumeC:          resumeC,
+		seekC:            seekC,
+		log:              options.Log,
+		streams:          streams,
 	}
 
 	if options.OpLogDisabled == false {
@@ -1793,14 +1845,10 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 		}
 	}
 
-	for _, ns := range options.DirectReadNs {
+	if len(options.DirectReadNs) > 0 {
 		directReadWg.Add(1)
 		allWg.Add(1)
-		if options.SplitVector {
-			go DirectReadSplitVector(ctx, session, ns, options)
-		} else {
-			go DirectReadPaged(ctx, session, ns, options)
-		}
+		go ProcessDirectReads(ctx, session, options)
 	}
 
 	for _, ns := range options.ChangeStreamNs {

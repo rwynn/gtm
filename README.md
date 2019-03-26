@@ -140,7 +140,8 @@ validate your replica set. For local testing your replica set may contain a
 		Ordering:            gtm.Document,  // defaults to gtm.Oplog. ordering guarantee of events on the output channel as compared to the oplog
 		UpdateDataAsDelta:   false,         // set to true to only receive delta information in the Data field on updates (info straight from oplog)
 		DirectReadNs:        []string{"db.users"}, // set to a slice of namespaces to read data directly from bypassing the oplog
-		DirectReadSplitMax:  9,             // the max number of times to split a collection for concurrent reads (impacts memory consumption)
+		DirectReadSplitMax:  9,             // the max number of times to split a collection for concurrent reads (impacts memory consumption). use -1 to disable splitting.
+		DirectReadConcur:    4,             // the max number of direct read namespaces to allow running at the same time. All namespaces run concurrently by default. Use 1 to read the set serially.
 		Pipe:                PipeBuilder,   // an optional function to build aggregation pipelines
 		PipeAllowDisk:       false,         // true to allow MongoDB to use disk for aggregation pipeline options with large result sets
 		SplitVector:         false,         // whether or not to use internal MongoDB command split vector to split collections
