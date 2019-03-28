@@ -446,7 +446,8 @@ func (ctx *OpCtxMulti) Stop() {
 	if !ctx.stopped {
 		ctx.stopped = true
 		close(ctx.stopC)
-		for _, child := range ctx.contexts {
+		for _, c := range ctx.contexts {
+			child := c
 			go child.Stop()
 		}
 		ctx.allWg.Wait()
