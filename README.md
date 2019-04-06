@@ -4,6 +4,11 @@ gtm (go tail mongo) is a utility written in Go which tails the MongoDB oplog and
 It can be used to send emails to new users, [index documents](https://www.github.com/rwynn/monstache), 
 [write time series data](https://www.github.com/rwynn/mongofluxd), or something else.
 
+### Other branches ###
+If you are interested in trying the development version of gtm which targets the 
+[offical golang driver](https://github.com/mongodb/mongo-go-driver)
+from MongoDB then checkout the `leafny` branch.
+
 ### Requirements ###
 + [Go](http://golang.org/doc/install)
 + [globalsign/mgo](https://godoc.org/github.com/globalsign/mgo), a mongodb driver for Go
