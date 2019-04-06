@@ -22,6 +22,10 @@ var opCodes = [...]string{"c", "i", "u", "d"}
 
 type OrderingGuarantee int
 
+type errchk interface {
+	Err() error
+}
+
 const (
 	Oplog     OrderingGuarantee = iota // ops sent in oplog order (strong ordering)
 	Namespace                          // ops sent in oplog order within a namespace
@@ -459,6 +463,41 @@ func (ctx *OpCtxMulti) Stop() {
 	}
 }
 
+func positionLost(ec errchk) bool {
+	err := ec.Err()
+	if err != nil {
+		if ce, ok := err.(mongo.CommandError); ok {
+			code := ce.Code
+			if code == 136 { // cursor capped position lost
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func invalidCursor(ec errchk) bool {
+	err := ec.Err()
+	if err != nil {
+		if ce, ok := err.(mongo.CommandError); ok {
+			code := ce.Code
+			if code == 43 { // cursor not found
+				return true
+			}
+			if code == 11601 { // cursor interrupted
+				return true
+			}
+			if code == 136 { // cursor capped position lost
+				return true
+			}
+			if code == 237 { // cursor killed
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardInsertHandler) {
 	defer multi.allWg.Done()
 	if options == nil {
@@ -822,7 +861,7 @@ func TailOps(ctx *OpCtx, client *mongo.Client, channels []OpChan, o *Options) er
 		return err
 	}
 	var cursor *mongo.Cursor
-seek:
+restart:
 	if cursor != nil {
 		if err = cursor.Close(context.Background()); err != nil {
 			ctx.ErrC <- errors.Wrap(err, "Error tailing the oplog")
@@ -831,35 +870,9 @@ seek:
 	cursor, err = GetOpLogCursor(client, cts, o)
 	if err != nil {
 		ctx.ErrC <- errors.Wrap(err, "Error establishing the oplog cursor")
-		goto seek
+		goto restart
 	}
 retry:
-	select {
-	case <-ctx.stopC:
-		if err = cursor.Close(context.Background()); err != nil {
-			ctx.ErrC <- errors.Wrap(err, "Error closing the oplog cursor")
-		}
-		return nil
-	case ts := <-ctx.seekC:
-		cts = ts
-		goto seek
-	case <-ctx.pauseC:
-		<-ctx.resumeC
-		select {
-		case <-ctx.stopC:
-			if err = cursor.Close(context.Background()); err != nil {
-				ctx.ErrC <- errors.Wrap(err, "Error closing the oplog cursor")
-			}
-			return nil
-		case ts := <-ctx.seekC:
-			cts = ts
-			goto seek
-		default:
-			break
-		}
-	default:
-		break
-	}
 	tctx, cancel := context.WithTimeout(context.Background(), time.Duration(o.MaxWaitSecs)*time.Second)
 	for cursor.Next(tctx) {
 		var entry OpLog
@@ -898,8 +911,9 @@ retry:
 			return nil
 		case ts := <-ctx.seekC:
 			cts = ts
-			goto seek
+			goto restart
 		case <-ctx.pauseC:
+			cursor.Close(context.Background())
 			<-ctx.resumeC
 			select {
 			case <-ctx.stopC:
@@ -909,15 +923,56 @@ retry:
 				return nil
 			case ts := <-ctx.seekC:
 				cts = ts
-				goto seek
+				goto restart
 			default:
-				cts = op.Timestamp
+				goto restart
 			}
 		default:
 			cts = op.Timestamp
 		}
 	}
+	err = tctx.Err()
 	cancel()
+	if err != nil {
+		if err == context.DeadlineExceeded || err == context.Canceled {
+			select {
+			case <-ctx.stopC:
+				cursor.Close(context.Background())
+				return nil
+			case ts := <-ctx.seekC:
+				cts = ts
+				goto restart
+			case <-ctx.pauseC:
+				cursor.Close(context.Background())
+				select {
+				case <-ctx.stopC:
+					cursor.Close(context.Background())
+					return nil
+				case <-ctx.resumeC:
+					goto restart
+				case <-ctx.stopC:
+					return nil
+				}
+			default:
+				goto retry
+			}
+		}
+	}
+	if invalidCursor(cursor) {
+		if positionLost(cursor) {
+			cts, _ = FirstOpTimestamp(client, o)
+		}
+		cursor.Close(context.Background())
+		goto restart
+	}
+	if err = cursor.Err(); err != nil {
+		if et, ok := err.(net.Error); ok && et.Timeout() {
+			goto retry
+		} else {
+			cursor.Close(context.Background())
+			goto restart
+		}
+	}
 	goto retry
 	return nil
 }
@@ -1002,7 +1057,7 @@ retry:
 	}
 	if err = cursor.Close(context.Background()); err != nil {
 		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf(`
-            Error closing direct read cursor of collection %s. Will retry segment.
+        Error closing direct read cursor of collection %s. Will retry segment.
         `, ns))
 		ctx.allWg.Add(1)
 		ctx.DirectReadWg.Add(1)
@@ -1213,6 +1268,16 @@ restart:
 				ctx.ErrC <- errors.Wrap(err, "Error consuming change stream. Will retry.")
 			}
 		}
+		if invalidCursor(stream) {
+			if positionLost(stream) {
+				resumeAfter = nil
+				startAt = nil
+			}
+			if err = stream.Close(context.Background()); err != nil {
+				ctx.ErrC <- errors.Wrap(err, "Error closing change stream.")
+			}
+			goto restart
+		}
 		if err = stream.Err(); err != nil {
 			if et, ok := err.(net.Error); ok && et.Timeout() {
 				goto retry
@@ -1242,8 +1307,8 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 	stats, err = GetCollectionStats(ctx, client, ns)
 	if err != nil {
 		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf(`
-			Error reading collection stats for %s. Used to calibrate batch size.
-			`, ns))
+		Error reading collection stats for %s. Used to calibrate batch size.
+		`, ns))
 	}
 	c := client.Database(n.database).Collection(n.collection)
 	const defaultSegmentSize = 50000
