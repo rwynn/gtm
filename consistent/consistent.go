@@ -4,9 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"github.com/BurntSushi/toml"
-	"github.com/globalsign/mgo/bson"
 	"github.com/rwynn/gtm"
 	"github.com/serialx/hashring"
+	"go.mongodb.org/mongo-driver/bson/objectid"
 )
 
 type ConfigOptions struct {
@@ -64,8 +64,8 @@ func ConsistentHashFilter(name string, workers []string) (gtm.OpFilter, error) {
 		if op.Id != nil {
 			var idStr string
 			switch op.Id.(type) {
-			case bson.ObjectId:
-				idStr = op.Id.(bson.ObjectId).Hex()
+			case objectid.ObjectID:
+				idStr = op.Id.(objectid.ObjectID).Hex()
 			default:
 				idStr = fmt.Sprintf("%v", op.Id)
 			}

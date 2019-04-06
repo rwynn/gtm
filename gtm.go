@@ -1,12 +1,16 @@
 package gtm
 
 import (
+	"context"
 	"fmt"
-	"github.com/globalsign/mgo"
-	"github.com/globalsign/mgo/bson"
 	"github.com/pkg/errors"
 	"github.com/serialx/hashring"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"log"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -15,9 +19,6 @@ import (
 )
 
 var opCodes = [...]string{"c", "i", "u", "d"}
-
-var defaultOpLogDatabaseName = "local"
-var defaultOpLogCollectionName = "oplog.rs"
 
 type OrderingGuarantee int
 
@@ -40,9 +41,8 @@ type Options struct {
 	Filter              OpFilter
 	NamespaceFilter     OpFilter
 	OpLogDisabled       bool
-	OpLogDatabaseName   *string
-	OpLogCollectionName *string
-	CursorTimeout       *string // deprecated
+	OpLogDatabaseName   string
+	OpLogCollectionName string
 	ChannelSize         int
 	BufferSize          int
 	BufferDuration      time.Duration
@@ -53,11 +53,10 @@ type Options struct {
 	ChangeStreamNs      []string
 	DirectReadNs        []string
 	DirectReadFilter    OpFilter
-	DirectReadSplitMax  int
+	DirectReadSplitMax  int32
+	DirectReadConcur    int
 	Unmarshal           DataUnmarshaller
 	Pipe                PipelineBuilder
-	PipeAllowDisk       bool
-	SplitVector         bool
 	Log                 *log.Logger
 }
 
@@ -66,58 +65,48 @@ type Op struct {
 	Operation         string                 `json:"operation"`
 	Namespace         string                 `json:"namespace"`
 	Data              map[string]interface{} `json:"data,omitempty"`
-	Timestamp         bson.MongoTimestamp    `json:"timestamp"`
+	Timestamp         primitive.Timestamp    `json:"timestamp"`
 	Source            QuerySource            `json:"source"`
 	Doc               interface{}            `json:"doc,omitempty"`
 	UpdateDescription map[string]interface{} `json:"updateDescription,omitempty`
 }
 
 type OpLog struct {
-	Timestamp    bson.MongoTimestamp "ts"
-	HistoryID    int64               "h"
-	MongoVersion int                 "v"
-	Operation    string              "op"
-	Namespace    string              "ns"
-	Doc          *bson.Raw           "o"
-	Update       *bson.Raw           "o2"
+	Timestamp    primitive.Timestamp    "ts"
+	HistoryID    int64                  "h"
+	MongoVersion int                    "v"
+	Operation    string                 "op"
+	Namespace    string                 "ns"
+	Doc          map[string]interface{} "o"
+	Update       map[string]interface{} "o2"
 }
 
-type SplitVectorResult struct {
-	SplitKeys []bson.M "splitKeys"
-	Ok        int      "ok"
-}
-
-type SplitVectorRequest struct {
-	SplitVector    string      "splitVector"
-	KeyPattern     bson.M      "keyPattern"
-	Min            interface{} "min"
-	Max            interface{} "max"
-	MaxChunkSize   int         "maxChunkSize"
-	MaxSplitPoints int         "maxSplitPoints"
-	Force          bool        "force"
+type ChangeDocNs struct {
+	Database   string "db"
+	Collection string "coll"
 }
 
 type ChangeDoc struct {
 	DocKey            map[string]interface{} "documentKey"
 	Id                interface{}            "_id"
 	Operation         string                 "operationType"
-	FullDoc           *bson.Raw              "fullDocument"
-	Namespace         map[string]string      "ns"
-	Timestamp         bson.MongoTimestamp    "clusterTime"
-	UpdateDescription *bson.Raw              "updateDescription"
+	FullDoc           map[string]interface{} "fullDocument"
+	Namespace         ChangeDocNs            "ns"
+	Timestamp         primitive.Timestamp    "clusterTime"
+	UpdateDescription map[string]interface{} "updateDescription"
 }
 
 func (cd *ChangeDoc) docId() interface{} {
 	return cd.DocKey["_id"]
 }
 
-func (cd *ChangeDoc) mapTimestamp() bson.MongoTimestamp {
-	if cd.Timestamp > 0 {
+func (cd *ChangeDoc) mapTimestamp() primitive.Timestamp {
+	if cd.Timestamp.T > 0 {
 		// only supported in version 4.0
 		return cd.Timestamp
 	} else {
 		t := time.Now().UTC().Unix()
-		return bson.MongoTimestamp(t << 32)
+		return primitive.Timestamp{T: uint32(t << 32)}
 	}
 }
 
@@ -128,7 +117,7 @@ func (cd *ChangeDoc) mapOperation() string {
 		return "u"
 	} else if cd.Operation == "delete" {
 		return "d"
-	} else if cd.Operation == "invalidate" {
+	} else if cd.Operation == "invalidate" || cd.Operation == "drop" || cd.Operation == "dropDatabase" {
 		return "c"
 	} else {
 		return ""
@@ -147,8 +136,20 @@ func (cd *ChangeDoc) isInvalidate() bool {
 	return cd.Operation == "invalidate"
 }
 
+func (cd *ChangeDoc) isDrop() bool {
+	return cd.Operation == "drop"
+}
+
+func (cd *ChangeDoc) isDropDatabase() bool {
+	return cd.Operation == "dropDatabase"
+}
+
 func (cd *ChangeDoc) mapNs() string {
-	return cd.Namespace["db"] + "." + cd.Namespace["coll"]
+	if cd.Namespace.Collection != "" {
+		return cd.Namespace.Database + "." + cd.Namespace.Collection
+	} else {
+		return cd.Namespace.Database + ".cmd"
+	}
 }
 
 type Doc struct {
@@ -156,15 +157,15 @@ type Doc struct {
 }
 
 type CollectionStats struct {
-	Count         int64 "count"
-	AvgObjectSize int64 "avgObjSize"
+	Count         int32 "count"
+	AvgObjectSize int32 "avgObjSize"
 }
 
 type CollectionSegment struct {
 	min         interface{}
 	max         interface{}
 	splitKey    string
-	splits      []bson.M
+	splits      []map[string]interface{}
 	subSegments []*CollectionSegment
 }
 
@@ -173,17 +174,15 @@ func (cs *CollectionSegment) shrinkTo(next interface{}) {
 }
 
 func (cs *CollectionSegment) toSelector() bson.M {
-	var sel bson.M
-	rang := bson.M{}
-	if cs.max != nil {
-		rang["$lt"] = cs.max
-	}
+	sel, doc := bson.M{}, bson.M{}
 	if cs.min != nil {
-		rang["$gte"] = cs.min
+		doc["$gte"] = cs.min
 	}
-	if len(rang) > 0 {
-		sel = bson.M{}
-		sel[cs.splitKey] = rang
+	if cs.max != nil {
+		doc["$lt"] = cs.max
+	}
+	if len(doc) > 0 {
+		sel[cs.splitKey] = doc
 	}
 	return sel
 }
@@ -214,16 +213,18 @@ func (cs *CollectionSegment) divide() {
 	cs.subSegments = append(cs.subSegments, ns)
 }
 
-func (cs *CollectionSegment) init(c *mgo.Collection) (err error) {
-	doc := bson.M{}
-	var q *mgo.Query
-	q = c.Find(nil).Sort(cs.splitKey).Limit(1)
-	if err = q.One(&doc); err != nil {
+func (cs *CollectionSegment) init(c *mongo.Collection) (err error) {
+	opts := &options.FindOneOptions{}
+	opts.SetSort(bson.M{cs.splitKey: 1})
+	doc := make(map[string]interface{})
+	if err = c.FindOne(context.Background(), nil, opts).Decode(doc); err != nil {
 		return
 	}
 	cs.min = doc[cs.splitKey]
-	q = c.Find(nil).Sort("-" + cs.splitKey).Limit(1)
-	if err = q.One(&doc); err != nil {
+	opts = &options.FindOneOptions{}
+	opts.SetSort(bson.M{cs.splitKey: -1})
+	doc = make(map[string]interface{})
+	if err = c.FindOne(context.Background(), nil, opts).Decode(doc); err != nil {
 		return
 	}
 	cs.max = doc[cs.splitKey]
@@ -236,11 +237,11 @@ type OpLogEntry map[string]interface{}
 
 type OpFilter func(*Op) bool
 
-type ShardInsertHandler func(*ShardInfo) (*mgo.Session, error)
+type ShardInsertHandler func(*ShardInfo) (*mongo.Client, error)
 
-type TimestampGenerator func(*mgo.Session, *Options) bson.MongoTimestamp
+type TimestampGenerator func(*mongo.Client, *Options) (primitive.Timestamp, error)
 
-type DataUnmarshaller func(namespace string, raw *bson.Raw) (interface{}, error)
+type DataUnmarshaller func(namespace string, cursor mongo.Cursor) (interface{}, error)
 
 type PipelineBuilder func(namespace string, changeStream bool) ([]interface{}, error)
 
@@ -251,19 +252,19 @@ type OpBuf struct {
 }
 
 type OpCtx struct {
-	lock         *sync.Mutex
-	OpC          OpChan
-	ErrC         chan error
-	DirectReadWg *sync.WaitGroup
-	stopC        chan bool
-	allWg        *sync.WaitGroup
-	seekC        chan bson.MongoTimestamp
-	pauseC       chan bool
-	resumeC      chan bool
-	paused       bool
-	stopped      bool
-	log          *log.Logger
-	streams      int
+	lock             *sync.Mutex
+	OpC              OpChan
+	ErrC             chan error
+	DirectReadWg     *sync.WaitGroup
+	directReadConcWg *sync.WaitGroup
+	stopC            chan bool
+	allWg            *sync.WaitGroup
+	seekC            chan primitive.Timestamp
+	pauseC           chan bool
+	resumeC          chan bool
+	paused           bool
+	stopped          bool
+	log              *log.Logger
 }
 
 type OpCtxMulti struct {
@@ -272,15 +273,14 @@ type OpCtxMulti struct {
 	OpC          OpChan
 	ErrC         chan error
 	DirectReadWg *sync.WaitGroup
-	opWg         *sync.WaitGroup
 	stopC        chan bool
 	allWg        *sync.WaitGroup
+	seekC        chan primitive.Timestamp
 	pauseC       chan bool
 	resumeC      chan bool
 	paused       bool
 	stopped      bool
 	log          *log.Logger
-	streams      int
 }
 
 type ShardInfo struct {
@@ -323,6 +323,47 @@ func (n *N) parse(ns string) (err error) {
 	return
 }
 
+func (n *N) parseForChanges(ns string) {
+	if ns == "" {
+		// watch the whole deployment
+		n.database = ""
+		n.collection = ""
+		return
+	}
+	parts := strings.SplitN(ns, ".", 2)
+	if len(parts) == 1 {
+		n.database = parts[0]
+		n.collection = ""
+	} else {
+		n.database = parts[0]
+		n.collection = parts[1]
+	}
+	return
+}
+
+func (n *N) desc() (dsc string) {
+	if n.isDatabase() {
+		dsc = fmt.Sprintf("database %s", n.database)
+	} else if n.isCollection() {
+		dsc = fmt.Sprintf("collection %s.%s", n.database, n.collection)
+	} else {
+		dsc = "the deployment"
+	}
+	return
+}
+
+func (n *N) isDeployment() bool {
+	return n.database == "" && n.collection == ""
+}
+
+func (n *N) isDatabase() bool {
+	return n.database != "" && n.collection == ""
+}
+
+func (n *N) isCollection() bool {
+	return n.database != "" && n.collection != ""
+}
+
 func (shard *ShardInfo) GetURL() string {
 	hostParts := strings.SplitN(shard.hostname, "/", 2)
 	if len(hostParts) == 2 {
@@ -332,42 +373,16 @@ func (shard *ShardInfo) GetURL() string {
 	}
 }
 
-func (ctx *OpCtx) repairSession(session *mgo.Session) *mgo.Session {
-	defer session.Close()
-	return session.Copy()
-}
-
-func (ctx *OpCtx) waitForConnection(wg *sync.WaitGroup, session *mgo.Session, options *Options) {
-	defer wg.Done()
-	t := time.NewTicker(5 * time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.stopC:
-			return
-		case <-t.C:
-			s := session.Copy()
-			if err := s.Ping(); err == nil {
-				s.Close()
-				return
-			}
-			s.Close()
-		}
-	}
-}
-
 func (ctx *OpCtx) isStopped() bool {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
 	return ctx.stopped
 }
 
-func (ctx *OpCtx) Since(ts bson.MongoTimestamp) {
+func (ctx *OpCtx) Since(ts primitive.Timestamp) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
-	for i := 0; i < ctx.streams; i++ {
-		ctx.seekC <- ts
-	}
+	ctx.seekC <- ts
 }
 
 func (ctx *OpCtx) Pause() {
@@ -375,9 +390,7 @@ func (ctx *OpCtx) Pause() {
 	defer ctx.lock.Unlock()
 	if !ctx.paused {
 		ctx.paused = true
-		for i := 0; i < ctx.streams; i++ {
-			ctx.pauseC <- true
-		}
+		ctx.pauseC <- true
 	}
 }
 
@@ -386,9 +399,7 @@ func (ctx *OpCtx) Resume() {
 	defer ctx.lock.Unlock()
 	if ctx.paused {
 		ctx.paused = false
-		for i := 0; i < ctx.streams; i++ {
-			ctx.resumeC <- true
-		}
+		ctx.resumeC <- true
 	}
 }
 
@@ -399,12 +410,10 @@ func (ctx *OpCtx) Stop() {
 		ctx.stopped = true
 		close(ctx.stopC)
 		ctx.allWg.Wait()
-		close(ctx.OpC)
-		close(ctx.ErrC)
 	}
 }
 
-func (ctx *OpCtxMulti) Since(ts bson.MongoTimestamp) {
+func (ctx *OpCtxMulti) Since(ts primitive.Timestamp) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
 	for _, child := range ctx.contexts {
@@ -417,9 +426,7 @@ func (ctx *OpCtxMulti) Pause() {
 	defer ctx.lock.Unlock()
 	if !ctx.paused {
 		ctx.paused = true
-		for i := 0; i < ctx.streams; i++ {
-			ctx.pauseC <- true
-		}
+		ctx.pauseC <- true
 		for _, child := range ctx.contexts {
 			child.Pause()
 		}
@@ -431,9 +438,7 @@ func (ctx *OpCtxMulti) Resume() {
 	defer ctx.lock.Unlock()
 	if ctx.paused {
 		ctx.paused = false
-		for i := 0; i < ctx.streams; i++ {
-			ctx.resumeC <- true
-		}
+		ctx.resumeC <- true
 		for _, child := range ctx.contexts {
 			child.Resume()
 		}
@@ -451,9 +456,6 @@ func (ctx *OpCtxMulti) Stop() {
 			go child.Stop()
 		}
 		ctx.allWg.Wait()
-		ctx.opWg.Wait()
-		close(ctx.OpC)
-		close(ctx.ErrC)
 	}
 }
 
@@ -469,59 +471,44 @@ func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardIn
 		case <-multi.stopC:
 			return
 		case <-multi.pauseC:
+			<-multi.resumeC
 			select {
 			case <-multi.stopC:
 				return
-			case <-multi.resumeC:
-				break
 			}
 		case err := <-ctx.ErrC:
-			if err == nil {
-				break
-			}
-			multi.ErrC <- err
+			multi.ErrC <- errors.Wrap(err, "Error tailing shards")
 		case op := <-ctx.OpC:
-			if op == nil {
-				break
-			}
 			// new shard detected
-			multi.lock.Lock()
-			if multi.stopped {
-				multi.lock.Unlock()
-				break
-			}
 			shardInfo := &ShardInfo{
 				hostname: op.Data["host"].(string),
 			}
 			shardSession, err := handler(shardInfo)
 			if err != nil {
 				multi.ErrC <- errors.Wrap(err, "Error calling shard handler")
-				multi.lock.Unlock()
-				break
+				continue
 			}
 			shardCtx := Start(shardSession, options)
+			multi.lock.Lock()
 			multi.contexts = append(multi.contexts, shardCtx)
 			multi.DirectReadWg.Add(1)
-			multi.allWg.Add(1)
-			multi.opWg.Add(2)
 			go func() {
 				defer multi.DirectReadWg.Done()
 				shardCtx.DirectReadWg.Wait()
 			}()
+			multi.allWg.Add(1)
 			go func() {
 				defer multi.allWg.Done()
 				shardCtx.allWg.Wait()
 			}()
 			go func(c OpChan) {
-				defer multi.opWg.Done()
 				for op := range c {
 					multi.OpC <- op
 				}
 			}(shardCtx.OpC)
 			go func(c chan error) {
-				defer multi.opWg.Done()
 				for err := range c {
-					multi.ErrC <- err
+					multi.ErrC <- errors.Wrap(err, "Error tailing shards")
 				}
 			}(shardCtx.ErrC)
 			multi.lock.Unlock()
@@ -530,24 +517,14 @@ func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardIn
 }
 
 func (ctx *OpCtxMulti) AddShardListener(
-	configSession *mgo.Session, shardOptions *Options, handler ShardInsertHandler) {
-	ctx.lock.Lock()
-	defer ctx.lock.Unlock()
+	configSession *mongo.Client, shardOptions *Options, handler ShardInsertHandler) {
 	opts := DefaultOptions()
-	if shardOptions != nil && shardOptions.OpLogDisabled {
-		opts.ChangeStreamNs = []string{"config.shards"}
-		opts.NamespaceFilter = func(op *Op) bool {
-			return op.IsInsert()
-		}
-	} else {
-		opts.NamespaceFilter = func(op *Op) bool {
-			return op.Namespace == "config.shards" && op.IsInsert()
-		}
+	opts.NamespaceFilter = func(op *Op) bool {
+		return op.Namespace == "config.shards" && op.IsInsert()
 	}
 	configCtx := Start(configSession, opts)
 	ctx.allWg.Add(1)
 	go tailShards(ctx, configCtx, shardOptions, handler)
-	ctx.streams += 1
 }
 
 func ChainOpFilters(filters ...OpFilter) OpFilter {
@@ -647,11 +624,10 @@ func (this *OpBuf) HasOne() bool {
 	return len(this.Entries) == 1
 }
 
-func (this *OpBuf) Flush(s *mgo.Session, ctx *OpCtx, options *Options) {
+func (this *OpBuf) Flush(client *mongo.Client, ctx *OpCtx, options *Options) {
 	if len(this.Entries) == 0 {
 		return
 	}
-	session := s.Copy()
 	ns := make(map[string][]interface{})
 	byId := make(map[interface{}][]*Op)
 	for _, op := range this.Entries {
@@ -664,42 +640,31 @@ func (this *OpBuf) Flush(s *mgo.Session, ctx *OpCtx, options *Options) {
 retry:
 	for n, opIds := range ns {
 		var parts = strings.SplitN(n, ".", 2)
-		var results []*bson.Raw
 		db, col := parts[0], parts[1]
 		sel := bson.M{"_id": bson.M{"$in": opIds}}
-		collection := session.DB(db).C(col)
-		err := collection.Find(sel).All(&results)
+		collection := client.Database(db).Collection(col)
+		cursor, err := collection.Find(context.Background(), sel)
 		if err == nil {
-			for _, result := range results {
-				var doc Doc
-				result.Unmarshal(&doc)
-				resultId := fmt.Sprintf("%s.%v", n, doc.Id)
-				if ops, ok := byId[resultId]; ok {
-					for _, o := range ops {
-						if u, err := options.Unmarshal(o.Namespace, result); err == nil {
-							o.processData(u)
-						} else {
-							ctx.ErrC <- err
+			for cursor.Next(context.Background()) {
+				doc := make(map[string]interface{})
+				if err = cursor.Decode(doc); err == nil {
+					resultId := fmt.Sprintf("%s.%v", n, doc["_id"])
+					if ops, ok := byId[resultId]; ok {
+						for _, o := range ops {
+							o.processData(doc)
 						}
 					}
+
 				}
+			}
+			if err = cursor.Close(context.Background()); err != nil {
+				ctx.ErrC <- errors.Wrap(err, "Error finding documents to associate with ops")
 			}
 		} else {
 			ctx.ErrC <- errors.Wrap(err, "Error finding documents to associate with ops")
-			var wg sync.WaitGroup
-			wg.Add(1)
-			go ctx.waitForConnection(&wg, session, options)
-			wg.Wait()
-			if ctx.isStopped() {
-				session.Close()
-				this.Entries = nil
-				return
-			}
-			session = ctx.repairSession(session)
-			goto retry
+			break retry
 		}
 	}
-	session.Close()
 	for _, op := range this.Entries {
 		if op.matchesFilter(options) {
 			ctx.OpC <- op
@@ -743,111 +708,91 @@ func (this *Op) processData(data interface{}) {
 	}
 }
 
-func (this *Op) parseOplogChange(m map[string]interface{}) {
-	changeDesc := map[string]interface{}{}
-	if !UpdateIsReplace(m) {
-		if setmap, ok := m["$set"]; ok {
-			s := map[string]interface{}{}
-			for key, val := range setmap.(map[string]interface{}) {
-				s[key] = val
-			}
-			changeDesc["updatedFields"] = s
-		}
-		if unsetmap, ok := m["$unset"]; ok {
-			s := []string{}
-			for key := range unsetmap.(map[string]interface{}) {
-				s = append(s, key)
-			}
-			changeDesc["removedFields"] = s
-		}
-	}
-	this.UpdateDescription = changeDesc
-}
-
 func (this *Op) ParseLogEntry(entry *OpLog, options *Options) (include bool, err error) {
-	var rawField *bson.Raw
-	var u interface{}
+	var rawField map[string]interface{}
 	this.Operation = entry.Operation
 	this.Timestamp = entry.Timestamp
 	this.Namespace = entry.Namespace
-	if this.shouldParse() == false {
-		return
-	}
-	if this.IsCommand() {
-		var objectField map[string]interface{}
-		rawField = entry.Doc
-		err = rawField.Unmarshal(&objectField)
-		this.processData(objectField)
-	}
-	if this.matchesNsFilter(options) {
-		if this.IsInsert() || this.IsDelete() || this.IsUpdate() {
-			if this.IsUpdate() {
-				rawField = entry.Update
-			} else {
-				rawField = entry.Doc
-			}
-			var doc Doc
-			rawField.Unmarshal(&doc)
-			this.Id = doc.Id
-			if this.IsInsert() {
-				if u, err = options.Unmarshal(this.Namespace, rawField); err == nil {
-					this.processData(u)
+	if this.shouldParse() {
+		if this.IsCommand() {
+			rawField = entry.Doc
+			this.processData(rawField)
+		}
+		if this.matchesNsFilter(options) {
+			if this.IsInsert() || this.IsDelete() || this.IsUpdate() {
+				if this.IsUpdate() {
+					rawField = entry.Update
+				} else {
+					rawField = entry.Doc
 				}
-			} else if this.IsUpdate() {
-				var changeField map[string]interface{}
-				rawField = entry.Doc
-				rawField.Unmarshal(&changeField)
-				this.parseOplogChange(changeField)
-				if options.UpdateDataAsDelta || UpdateIsReplace(changeField) {
-					if u, err = options.Unmarshal(this.Namespace, rawField); err == nil {
-						this.processData(u)
+				this.Id = rawField["_id"]
+				if this.IsInsert() {
+					this.processData(rawField)
+				} else if this.IsUpdate() {
+					rawField = entry.Doc
+					if options.UpdateDataAsDelta || UpdateIsReplace(rawField) {
+						this.processData(rawField)
 					}
 				}
+				include = true
+			} else if this.IsCommand() {
+				include = this.IsDrop()
 			}
-			include = true
-		} else if this.IsCommand() {
-			include = this.IsDrop()
 		}
 	}
 	return
 }
 
-func OpLogCollection(session *mgo.Session, options *Options) *mgo.Collection {
-	localDB := session.DB(*options.OpLogDatabaseName)
-	return localDB.C(*options.OpLogCollectionName)
+func OpLogCollectionName(client *mongo.Client, options *Options) string {
+	return "oplog.rs"
 }
 
-func ParseTimestamp(timestamp bson.MongoTimestamp) (int32, int32) {
-	ordinal := (timestamp << 32) >> 32
-	ts := (timestamp >> 32)
-	return int32(ts), int32(ordinal)
+func OpLogCollection(client *mongo.Client, options *Options) *mongo.Collection {
+	localDB := client.Database(options.OpLogDatabaseName)
+	return localDB.Collection(options.OpLogCollectionName)
+}
+
+func ParseTimestamp(timestamp primitive.Timestamp) (uint32, uint32) {
+	return timestamp.T, timestamp.I
 }
 
 func validOps() bson.M {
 	return bson.M{"op": bson.M{"$in": opCodes}}
 }
 
-func LastOpTimestamp(session *mgo.Session, options *Options) bson.MongoTimestamp {
-	var opLog OpLog
-	collection := OpLogCollection(session, options)
-	collection.Find(validOps()).Select(bson.M{"ts": 1}).Sort("-$natural").One(&opLog)
-	return opLog.Timestamp
+func LastOpTimestamp(client *mongo.Client, o *Options) (primitive.Timestamp, error) {
+	opLog := OpLog{}
+	filter := validOps()
+	opts := &options.FindOneOptions{}
+	opts.SetSort(bson.M{"$natural": -1})
+	c := OpLogCollection(client, o)
+	err := c.FindOne(context.Background(), filter, opts).Decode(&opLog)
+	return opLog.Timestamp, err
 }
 
-func FirstOpTimestamp(session *mgo.Session, options *Options) bson.MongoTimestamp {
-	var opLog OpLog
-	collection := OpLogCollection(session, options)
-	collection.Find(validOps()).Select(bson.M{"ts": 1}).Sort("$natural").One(&opLog)
-	return opLog.Timestamp
+func FirstOpTimestamp(client *mongo.Client, o *Options) (primitive.Timestamp, error) {
+	opLog := OpLog{}
+	filter := validOps()
+	opts := &options.FindOneOptions{}
+	opts.SetSort(bson.M{"$natural": 1})
+	c := OpLogCollection(client, o)
+	err := c.FindOne(context.Background(), filter, opts).Decode(&opLog)
+	return opLog.Timestamp, err
 }
 
-func GetOpLogQuery(session *mgo.Session, after bson.MongoTimestamp, options *Options) *mgo.Query {
+func GetOpLogCursor(client *mongo.Client, after primitive.Timestamp, o *Options) (*mongo.Cursor, error) {
 	query := bson.M{
 		"ts":          bson.M{"$gt": after},
 		"op":          bson.M{"$in": opCodes},
-		"fromMigrate": bson.M{"$exists": false}}
-	collection := OpLogCollection(session, options)
-	return collection.Find(query).LogReplay().Sort("$natural")
+		"fromMigrate": bson.M{"$exists": false},
+	}
+	opts := &options.FindOptions{}
+	opts.SetSort(bson.M{"$natural": 1})
+	opts.SetCursorType(options.TailableAwait)
+	//opts.SetOplogReplay(true)
+	//opts.SetNoCursorTimeout(true)
+	collection := OpLogCollection(client, o)
+	return collection.Find(context.Background(), query, opts)
 }
 
 func opDataReady(op *Op, options *Options) (ready bool) {
@@ -863,235 +808,130 @@ func opDataReady(op *Op, options *Options) (ready bool) {
 	return
 }
 
-func TailOps(ctx *OpCtx, session *mgo.Session, channels []OpChan, options *Options) error {
+func TailOps(ctx *OpCtx, client *mongo.Client, channels []OpChan, o *Options) error {
 	defer ctx.allWg.Done()
-	s := session.Copy()
-	currTimestamp := options.After(s, options)
-	var iter *mgo.Iter
 	var err error
-	sendError := func(err error) {
-		ctx.ErrC <- errors.Wrap(err, "Error tailing oplog entries")
+	var cts primitive.Timestamp
+	if o.After != nil {
+		cts, err = o.After(client, o)
+	} else {
+		cts, err = LastOpTimestamp(client, o)
 	}
-	timeout := time.Duration(options.MaxWaitSecs) * time.Second
+	if err != nil {
+		ctx.ErrC <- errors.Wrap(err, "Error finding timestamp in oplog")
+		return err
+	}
+	var cursor *mongo.Cursor
 seek:
-	for {
-		var entry OpLog
-		if iter != nil {
-			if err = iter.Close(); err != nil {
-				sendError(err)
-				var wg sync.WaitGroup
-				wg.Add(1)
-				go ctx.waitForConnection(&wg, s, options)
-				wg.Wait()
-				if ctx.isStopped() {
-					s.Close()
-					return nil
-				}
-				s = ctx.repairSession(s)
-			}
-		}
-		iter = GetOpLogQuery(s, currTimestamp, options).Tail(timeout)
-	retry:
-		for iter.Next(&entry) {
-			op := &Op{
-				Id:        "",
-				Operation: "",
-				Namespace: "",
-				Data:      nil,
-				Timestamp: bson.MongoTimestamp(0),
-				Source:    OplogQuerySource,
-			}
-			ok, err := op.ParseLogEntry(&entry, options)
-			if err == nil {
-				if ok && op.matchesFilter(options) {
-					if opDataReady(op, options) {
-						ctx.OpC <- op
-					} else {
-						// broadcast to fetch channels
-						for _, channel := range channels {
-							channel <- op
-						}
-					}
-				}
-			} else {
-				sendError(err)
-			}
-			select {
-			case <-ctx.stopC:
-				if err = iter.Close(); err != nil {
-					sendError(err)
-				}
-				s.Close()
-				return nil
-			case ts := <-ctx.seekC:
-				currTimestamp = ts
-				goto seek
-			case <-ctx.pauseC:
-				select {
-				case <-ctx.resumeC:
-					select {
-					case ts := <-ctx.seekC:
-						currTimestamp = ts
-						goto seek
-					default:
-						currTimestamp = op.Timestamp
-					}
-				case <-ctx.stopC:
-					if err = iter.Close(); err != nil {
-						sendError(err)
-					}
-					s.Close()
-					return nil
-				}
-			default:
-				currTimestamp = op.Timestamp
-			}
-		}
-		if iter.Timeout() {
-			select {
-			case <-ctx.stopC:
-				if err = iter.Close(); err != nil {
-					sendError(err)
-				}
-				s.Close()
-				return nil
-			case ts := <-ctx.seekC:
-				currTimestamp = ts
-				goto seek
-			default:
-				goto retry
-			}
+	if cursor != nil {
+		if err = cursor.Close(context.Background()); err != nil {
+			ctx.ErrC <- errors.Wrap(err, "Error tailing the oplog")
 		}
 	}
-	s.Close()
+	cursor, err = GetOpLogCursor(client, cts, o)
+	if err != nil {
+		ctx.ErrC <- errors.Wrap(err, "Error establishing the oplog cursor")
+		goto seek
+	}
+retry:
+	select {
+	case <-ctx.stopC:
+		if err = cursor.Close(context.Background()); err != nil {
+			ctx.ErrC <- errors.Wrap(err, "Error closing the oplog cursor")
+		}
+		return nil
+	case ts := <-ctx.seekC:
+		cts = ts
+		goto seek
+	case <-ctx.pauseC:
+		<-ctx.resumeC
+		select {
+		case <-ctx.stopC:
+			if err = cursor.Close(context.Background()); err != nil {
+				ctx.ErrC <- errors.Wrap(err, "Error closing the oplog cursor")
+			}
+			return nil
+		case ts := <-ctx.seekC:
+			cts = ts
+			goto seek
+		default:
+			break
+		}
+	default:
+		break
+	}
+	tctx, cancel := context.WithTimeout(context.Background(), time.Duration(o.MaxWaitSecs)*time.Second)
+	for cursor.Next(tctx) {
+		var entry OpLog
+		if err = cursor.Decode(&entry); err != nil {
+			ctx.ErrC <- errors.Wrap(err, "Error decoding the oplog document")
+			break
+		}
+		op := &Op{
+			Id:        "",
+			Operation: "",
+			Namespace: "",
+			Data:      nil,
+			Timestamp: primitive.Timestamp{},
+			Source:    OplogQuerySource,
+		}
+		ok, err := op.ParseLogEntry(&entry, o)
+		if err == nil {
+			if ok && op.matchesFilter(o) {
+				if opDataReady(op, o) {
+					ctx.OpC <- op
+				} else {
+					// broadcast to fetch channels
+					for _, channel := range channels {
+						channel <- op
+					}
+				}
+			}
+		} else {
+			ctx.ErrC <- errors.Wrap(err, "Error parsing the oplog document")
+		}
+		select {
+		case <-ctx.stopC:
+			if err = cursor.Close(context.Background()); err != nil {
+				ctx.ErrC <- errors.Wrap(err, "Error closing the oplog cursor")
+			}
+			return nil
+		case ts := <-ctx.seekC:
+			cts = ts
+			goto seek
+		case <-ctx.pauseC:
+			<-ctx.resumeC
+			select {
+			case <-ctx.stopC:
+				if err = cursor.Close(context.Background()); err != nil {
+					ctx.ErrC <- errors.Wrap(err, "Error closing the oplog cursor")
+				}
+				return nil
+			case ts := <-ctx.seekC:
+				cts = ts
+				goto seek
+			default:
+				cts = op.Timestamp
+			}
+		default:
+			cts = op.Timestamp
+		}
+	}
+	cancel()
+	goto retry
 	return nil
 }
 
-func DirectReadSplitVector(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (err error) {
+func DirectReadSegment(ctx *OpCtx, client *mongo.Client, ns string, o *Options, seg *CollectionSegment, stats *CollectionStats) (err error) {
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
-	s := session.Copy()
-	defer s.Close()
-	doPagedRead := func() {
-		ctx.allWg.Add(1)
-		ctx.DirectReadWg.Add(1)
-		go DirectReadPaged(ctx, session, ns, options)
-	}
+	defer ctx.directReadConcWg.Done()
 	n := &N{}
 	if err = n.parse(ns); err != nil {
 		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
 		return
 	}
-	var stats *CollectionStats
-	stats, _ = GetCollectionStats(ctx, s, ns)
-	col := s.DB(n.database).C(n.collection)
-	indexes, err := col.Indexes()
-	if err != nil {
-		msg := fmt.Sprintf("Unable to determine indexes on %s for direct read split vector", ns)
-		ctx.ErrC <- errors.Wrap(err, msg)
-		doPagedRead()
-		return
-	}
-	var maxSplits = options.DirectReadSplitMax
-	var splitMax, splitMin int
-	splitMin = 4
-	bestSplit := &CollectionSegment{
-		splitKey: "_id",
-	}
-	for _, index := range indexes {
-		key := strings.TrimPrefix(index.Key[0], "-")
-		if key == "_id" {
-			continue
-		}
-		if splitMax >= maxSplits {
-			break
-		}
-		cseg := &CollectionSegment{
-			splitKey: key,
-		}
-		err = cseg.init(col)
-		if err == nil {
-			dir := 1
-			if strings.HasPrefix(index.Key[0], "-") {
-				dir = -1
-			}
-			splitv := SplitVectorRequest{
-				SplitVector:    ns,
-				KeyPattern:     bson.M{cseg.splitKey: dir},
-				Min:            cseg.min,
-				Max:            cseg.max,
-				MaxChunkSize:   8,
-				MaxSplitPoints: maxSplits,
-			}
-			var result SplitVectorResult
-			err = s.Run(splitv, &result)
-			if err != nil || result.Ok == 0 {
-				msg := fmt.Sprintf("Split Vector admin command failed for key pattern %s in namespace %s", ns, key)
-				ctx.ErrC <- errors.Wrap(err, msg)
-				continue
-			}
-			curSplits := len(result.SplitKeys)
-			if curSplits > splitMax {
-				splitMax = curSplits
-				bestSplit = cseg
-				bestSplit.splits = result.SplitKeys
-			}
-		} else {
-			msg := fmt.Sprintf("Unable to check index bounds for namespace %s using key pattern %s", ns, key)
-			ctx.ErrC <- errors.Wrap(err, msg)
-		}
-	}
-	if splitMax < splitMin {
-		doPagedRead()
-		return
-	} else {
-		ctx.log.Printf("Found %d splits (%d segments) for namespace %s using index on %s", splitMax, splitMax+1, ns, bestSplit.splitKey)
-		bestSplit.divide()
-		if len(bestSplit.subSegments) > 0 {
-			for _, subseg := range bestSplit.subSegments {
-				ctx.allWg.Add(1)
-				ctx.DirectReadWg.Add(1)
-				go DirectReadSegment(ctx, session, ns, options, subseg, stats)
-			}
-		} else {
-			doPagedRead()
-			return
-		}
-	}
-	return
-}
-
-func notSupportedOnView(err error) bool {
-	switch e := err.(type) {
-	case *mgo.LastError:
-		return e.Code == 166 || e.Code == 167
-	case *mgo.QueryError:
-		return e.Code == 166 || e.Code == 167
-	}
-	return false
-}
-
-func GetCollectionStats(ctx *OpCtx, session *mgo.Session, ns string) (stats *CollectionStats, err error) {
-	stats = &CollectionStats{}
-	n := &N{}
-	if err = n.parse(ns); err != nil {
-		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
-		return
-	}
-	err = session.DB(n.database).Run(bson.D{{"collStats", n.collection}}, stats)
-	return
-}
-
-func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Options, seg *CollectionSegment, stats *CollectionStats) (err error) {
-	defer ctx.allWg.Done()
-	defer ctx.DirectReadWg.Done()
-	s := session.Copy()
-	n := &N{}
-	if err = n.parse(ns); err != nil {
-		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
-		return
-	}
-	var batch int64 = 1000
+	var batch int32 = 1000
 	if stats.AvgObjectSize != 0 {
 		batch = (8 * 1024 * 1024) / stats.AvgObjectSize // 8MB divided by avg doc size
 		if batch < 1000 {
@@ -1099,316 +939,366 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 			batch = 0
 		}
 	}
-restart:
-	var iter *mgo.Iter
-	c := s.DB(n.database).C(n.collection)
-	sel := seg.toSelector()
-	q := c.Find(sel)
+	opts := &options.FindOptions{}
 	if batch != 0 {
-		q.Batch(int(batch))
+		opts.SetBatchSize(batch)
 	}
-	iter = q.Iter()
-	if options.Pipe != nil {
-		var pipeline []interface{}
-		if pipeline, err = options.Pipe(ns, false); err != nil {
-			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline stages.")
-			s.Close()
-			return
-		}
-		if pipeline != nil && len(pipeline) > 0 {
-			var stages []interface{}
-			stages = append(stages, bson.M{"$match": sel})
-			for _, stage := range pipeline {
-				stages = append(stages, stage)
-			}
-			pipe := c.Pipe(stages)
-			if options.PipeAllowDisk {
-				pipe = pipe.AllowDiskUse()
-			}
-			if batch != 0 {
-				pipe = pipe.Batch(int(batch))
-			}
-			iter = pipe.Iter()
-		}
+	c := client.Database(n.database).Collection(n.collection)
+	sel := seg.toSelector()
+	cursor, err := c.Find(context.Background(), sel, opts)
+	if err != nil {
+		return
 	}
 retry:
-	var result = &bson.Raw{}
-	for iter.Next(&result) {
-		var doc Doc
-		result.Unmarshal(&doc)
+	select {
+	case <-ctx.stopC:
+		cursor.Close(context.Background())
+		return
+	default:
+		break
+	}
+	result := map[string]interface{}{}
+	tctx, cancel := context.WithTimeout(context.Background(), time.Duration(o.MaxWaitSecs)*time.Second)
+	for cursor.Next(tctx) {
+		if err = cursor.Decode(&result); err != nil {
+			ctx.ErrC <- errors.Wrap(err, "Error decoding cursor in direct reads")
+			result = map[string]interface{}{}
+			continue
+		}
 		t := time.Now().UTC().Unix()
 		op := &Op{
-			Id:        doc.Id,
+			Id:        result["_id"],
 			Operation: "i",
 			Namespace: ns,
 			Source:    DirectQuerySource,
-			Timestamp: bson.MongoTimestamp(t << 32),
+			Timestamp: primitive.Timestamp{T: uint32(t)},
 		}
-		if u, err := options.Unmarshal(ns, result); err == nil {
-			op.processData(u)
-			if op.matchesDirectFilter(options) {
-				ctx.OpC <- op
-			}
-		} else {
-			ctx.ErrC <- err
+		op.processData(result)
+		if op.matchesDirectFilter(o) {
+			ctx.OpC <- op
 		}
-		result = &bson.Raw{}
+		result = map[string]interface{}{}
 		select {
 		case <-ctx.stopC:
-			iter.Close()
-			s.Close()
+			cursor.Close(context.Background())
 			return
 		default:
 			continue
 		}
 	}
-	if iter.Timeout() {
-		select {
-		case <-ctx.stopC:
-			iter.Close()
-			s.Close()
-			return
-		default:
+	err = tctx.Err()
+	cancel()
+	if err == context.DeadlineExceeded || err == context.Canceled {
+		goto retry
+	}
+	if err = cursor.Err(); err != nil {
+		if et, ok := err.(net.Error); ok && et.Timeout() {
 			goto retry
+		} else {
+			ctx.ErrC <- errors.Wrap(err, fmt.Sprintf(`
+            Error performing direct read of collection %s
+            `, ns))
 		}
 	}
-	if err = iter.Close(); err != nil {
-		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error reading segment of collection %s. Will retry segment.", ns))
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go ctx.waitForConnection(&wg, s, options)
-		wg.Wait()
-		if ctx.isStopped() {
-			s.Close()
-			return
-		}
-		s = ctx.repairSession(s)
-		goto restart
+	if err = cursor.Close(context.Background()); err != nil {
+		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf(`
+            Error closing direct read cursor of collection %s. Will retry segment.
+        `, ns))
+		ctx.allWg.Add(1)
+		ctx.DirectReadWg.Add(1)
+		go DirectReadSegment(ctx, client, ns, o, seg, stats)
 	}
-	s.Close()
 	return
 }
 
-func ConsumeChangeStream(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (err error) {
-	defer ctx.allWg.Done()
-	s := session.Copy()
+func GetCollectionStats(ctx *OpCtx, client *mongo.Client, ns string) (stats *CollectionStats, err error) {
+	stats = &CollectionStats{}
 	n := &N{}
 	if err = n.parse(ns); err != nil {
-		ctx.ErrC <- errors.Wrap(err, "Error consuming change stream. Invalid namespace.")
+		ctx.ErrC <- errors.Wrap(err, "Error reading collection stats. Invalid namespace.")
 		return
 	}
-	var pipeline []interface{}
-	var token *bson.Raw
-	/*var startAt bson.MongoTimestamp
-	if options.After != nil {
-		pos := options.After(session, options)
-		if pos > 0 {
-			startAt = pos
-		} else if pos == 0 {
-			startAt = FirstOpTimestamp(session, options)
+	var result *mongo.SingleResult
+	cmd := bson.M{"collStats": n.collection}
+	result = client.Database(n.database).RunCommand(context.Background(), cmd)
+	err = result.Err()
+	if err == nil {
+		err = result.Decode(stats)
+	}
+	return
+}
+
+func ProcessDirectReads(ctx *OpCtx, client *mongo.Client, options *Options) (err error) {
+	defer ctx.allWg.Done()
+	defer ctx.DirectReadWg.Done()
+	concur := options.DirectReadConcur
+	running := 0
+	for _, ns := range options.DirectReadNs {
+		if concur > 0 && running >= concur {
+			ctx.directReadConcWg.Wait()
+			running = 0
 		}
-	}*/
-	var connected bool
-	if options.Pipe != nil {
+		ctx.DirectReadWg.Add(1)
+		ctx.directReadConcWg.Add(1)
+		ctx.allWg.Add(1)
+		go DirectReadPaged(ctx, client, ns, options)
+		running = running + 1
+	}
+	return
+}
+
+func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (err error) {
+	defer ctx.allWg.Done()
+	n := &N{}
+	n.parseForChanges(ns)
+	var pipeline []interface{}
+	var startAt *primitive.Timestamp
+	var resumeAfter interface{}
+	if o.After != nil {
+		if pos, err := o.After(client, o); err == nil {
+			if pos.T > 0 {
+				startAt = &pos
+			} else if pos.T == 0 {
+				if pos, err = FirstOpTimestamp(client, o); err == nil {
+					startAt = &pos
+				}
+			}
+		}
+	}
+	if o.Pipe != nil {
 		var stages []interface{}
-		if stages, err = options.Pipe(ns, true); err != nil {
+		if stages, err = o.Pipe(ns, true); err != nil {
 			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline stages.")
 			return
 		}
-		if stages != nil {
+		if stages != nil && len(stages) > 0 {
 			pipeline = stages
 		}
 	}
 restart:
 	for {
-		var stream *mgo.ChangeStream
-		opts := mgo.ChangeStreamOptions{
-			//StartAtOperationTime: startAt,
-			ResumeAfter:    token,
-			FullDocument:   "updateLookup",
-			MaxAwaitTimeMS: time.Duration(options.MaxWaitSecs) * time.Second,
+		var stream *mongo.ChangeStream
+		opts := options.ChangeStream()
+		opts.SetBatchSize(int32(o.ChannelSize))
+		opts.SetMaxAwaitTime(time.Duration(o.MaxWaitSecs) * time.Second)
+		opts.SetFullDocument(options.UpdateLookup)
+		opts.SetStartAtOperationTime(startAt)
+		opts.SetResumeAfter(resumeAfter)
+		if n.isDeployment() {
+			stream, err = client.Watch(context.Background(), pipeline, opts)
+		} else if n.isDatabase() {
+			d := client.Database(n.database)
+			stream, err = d.Watch(context.Background(), pipeline, opts)
+		} else {
+			c := client.Database(n.database).Collection(n.collection)
+			stream, err = c.Watch(context.Background(), pipeline, opts)
 		}
-		c := s.DB(n.database).C(n.collection)
-		stream, err = c.Watch(pipeline, opts)
 		if err != nil {
-			token = nil
-			connected = false
 			ctx.ErrC <- errors.Wrap(err, "Error starting change stream. Will retry.")
 			if stream != nil {
-				stream.Close()
+				stream.Close(context.Background())
 			}
-			var wg sync.WaitGroup
-			wg.Add(1)
-			go ctx.waitForConnection(&wg, s, options)
-			wg.Wait()
-			if ctx.isStopped() {
-				s.Close()
+			select {
+			case <-ctx.stopC:
 				return
+			default:
+				goto restart
 			}
-			s = ctx.repairSession(s)
-			goto restart
-		}
-		if !connected {
-			if token == nil {
-				ctx.log.Printf("Started watching changes on %s", ns)
-			} else {
-				ctx.log.Printf("Resumed watching changes on %s", ns)
-			}
-			connected = true
-			//startAt = 0
 		}
 	retry:
-		var changeDoc ChangeDoc
-		for stream.Next(&changeDoc) {
-			token = stream.ResumeToken()
-			if changeDoc.isInvalidate() {
+		tctx, cancel := context.WithTimeout(context.Background(), time.Duration(o.MaxWaitSecs)*time.Second)
+		for stream.Next(tctx) {
+			startAt = nil
+			var changeDoc ChangeDoc
+			if err = stream.Decode(&changeDoc); err != nil {
+				ctx.ErrC <- errors.Wrap(err, "Error decoding change doc.")
+				break
+			}
+			resumeAfter = changeDoc.Id
+			oper := changeDoc.mapOperation()
+			if changeDoc.isDrop() {
 				op := &Op{
-					Operation: changeDoc.mapOperation(),
-					Namespace: ns,
+					Operation: oper,
+					Namespace: changeDoc.mapNs(),
 					Source:    OplogQuerySource,
 					Timestamp: changeDoc.mapTimestamp(),
 				}
 				op.Data = map[string]interface{}{"drop": n.collection}
-				ctx.OpC <- op
-				token = nil
-				stream.Close()
+				if op.matchesNsFilter(o) {
+					ctx.OpC <- op
+				}
+			} else if changeDoc.isDropDatabase() {
+				op := &Op{
+					Operation: oper,
+					Namespace: changeDoc.mapNs(),
+					Source:    OplogQuerySource,
+					Timestamp: changeDoc.mapTimestamp(),
+				}
+				op.Data = map[string]interface{}{"dropDatabase": n.database}
+				if op.matchesNsFilter(o) {
+					ctx.OpC <- op
+				}
+			} else if changeDoc.isInvalidate() {
+				stream.Close(context.Background())
 				time.Sleep(time.Duration(5) * time.Second)
 				goto restart
-			} else {
-				kind := changeDoc.mapOperation()
-				if kind != "" {
-					op := &Op{
-						Id:        changeDoc.docId(),
-						Operation: kind,
-						Namespace: ns,
-						Source:    OplogQuerySource,
-						Timestamp: changeDoc.mapTimestamp(),
-					}
+			} else if oper != "" {
+				op := &Op{
+					Id:        changeDoc.docId(),
+					Operation: oper,
+					Namespace: changeDoc.mapNs(),
+					Source:    OplogQuerySource,
+					Timestamp: changeDoc.mapTimestamp(),
+				}
+				if op.matchesNsFilter(o) {
 					if changeDoc.hasUpdate() {
-						var udm map[string]interface{}
-						ud := changeDoc.UpdateDescription
-						if err := ud.Unmarshal(&udm); err != nil {
-							ctx.ErrC <- err
-						}
-						op.UpdateDescription = udm
+						op.UpdateDescription = changeDoc.UpdateDescription
 					}
 					if changeDoc.hasDoc() {
-						if u, err := options.Unmarshal(ns, changeDoc.FullDoc); err == nil {
-							op.processData(u)
-							if op.matchesDirectFilter(options) {
-								ctx.OpC <- op
-							}
-						} else {
-							ctx.ErrC <- err
-						}
-					} else {
-						if op.matchesDirectFilter(options) {
+						op.processData(changeDoc.FullDoc)
+						if op.matchesDirectFilter(o) {
 							ctx.OpC <- op
 						}
+					} else if op.matchesDirectFilter(o) {
+						ctx.OpC <- op
 					}
 				}
 			}
 			select {
 			case <-ctx.stopC:
-				stream.Close()
-				s.Close()
+				stream.Close(context.Background())
 				return
-			/*case ts := <-ctx.seekC:
-			startAt = ts
-			token = nil
-			stream.Close()
-			goto restart*/
+			case ts := <-ctx.seekC:
+				resumeAfter = nil
+				startAt = &ts
+				stream.Close(context.Background())
+				goto restart
 			case <-ctx.pauseC:
-				stream.Close()
+				stream.Close(context.Background())
 				select {
 				case <-ctx.resumeC:
 					goto restart
 				case <-ctx.stopC:
-					s.Close()
 					return
 				}
 			default:
 				continue
 			}
 		}
-		if stream.Timeout() {
-			select {
-			case <-ctx.stopC:
-				stream.Close()
-				s.Close()
-				return
-			/*case ts := <-ctx.seekC:
-			startAt = ts
-			token = nil
-			stream.Close()
-			goto restart*/
-			default:
+		err = tctx.Err()
+		cancel()
+		if err != nil {
+			if err == context.DeadlineExceeded || err == context.Canceled {
+				select {
+				case <-ctx.stopC:
+					stream.Close(context.Background())
+					return
+				case ts := <-ctx.seekC:
+					resumeAfter = nil
+					startAt = &ts
+					stream.Close(context.Background())
+					goto restart
+				case <-ctx.pauseC:
+					stream.Close(context.Background())
+					select {
+					case <-ctx.resumeC:
+						goto restart
+					case <-ctx.stopC:
+						return
+					}
+				default:
+					goto retry
+				}
+			} else {
+				ctx.ErrC <- errors.Wrap(err, "Error consuming change stream. Will retry.")
+			}
+		}
+		if err = stream.Err(); err != nil {
+			if et, ok := err.(net.Error); ok && et.Timeout() {
 				goto retry
+			} else {
+				ctx.ErrC <- errors.Wrap(err, "Error consuming change stream. Will retry.")
+				if err = stream.Close(context.Background()); err != nil {
+					ctx.ErrC <- errors.Wrap(err, "Error closing change stream.")
+				}
+				goto restart
 			}
 		}
-		if err = stream.Close(); err != nil {
-			connected = false
-			ctx.ErrC <- errors.Wrap(err, "Error consuming change stream. Will retry.")
-			var wg sync.WaitGroup
-			wg.Add(1)
-			go ctx.waitForConnection(&wg, s, options)
-			wg.Wait()
-			if ctx.isStopped() {
-				s.Close()
-				return
-			}
-			s = ctx.repairSession(s)
-		}
+		goto retry
 	}
-	s.Close()
 	return nil
 }
 
-func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Options) (err error) {
+func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (err error) {
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
-	s := session.Copy()
-	defer s.Close()
+	defer ctx.directReadConcWg.Done()
 	n := &N{}
 	if err = n.parse(ns); err != nil {
 		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
 		return
 	}
 	var stats *CollectionStats
-	stats, _ = GetCollectionStats(ctx, session, ns)
-	c := s.DB(n.database).C(n.collection)
+	stats, err = GetCollectionStats(ctx, client, ns)
+	if err != nil {
+		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf(`
+			Error reading collection stats for %s. Used to calibrate batch size.
+			`, ns))
+	}
+	c := client.Database(n.database).Collection(n.collection)
 	const defaultSegmentSize = 50000
-	var maxSplits = options.DirectReadSplitMax
-	var segmentSize int = defaultSegmentSize
+	var maxSplits int32 = o.DirectReadSplitMax
+	var segmentSize int32 = defaultSegmentSize
 	if stats.Count != 0 {
-		segmentSize = int(stats.Count) / (maxSplits + 1)
+		segmentSize = stats.Count / (maxSplits + 1)
 		if segmentSize < defaultSegmentSize {
 			segmentSize = defaultSegmentSize
 		}
 	}
+
 	segment := &CollectionSegment{
 		splitKey: "_id",
 	}
+	if maxSplits <= 0 {
+		ctx.allWg.Add(1)
+		ctx.DirectReadWg.Add(1)
+		ctx.directReadConcWg.Add(1)
+		go DirectReadSegment(ctx, client, ns, o, segment, stats)
+		return
+	}
 	var doc Doc
-	var splitCount int
-	pro := bson.M{"_id": 1}
+	var splitCount int32
+
+	pro := bson.M{"id": 1}
+
 	done := false
+
+	opts := &options.FindOneOptions{}
+	opts.SetSort(bson.M{"_id": 1})
+	opts.SetProjection(pro)
+	opts.SetSkip(int64(segmentSize))
+
 	for !done {
+
 		sel := bson.M{}
+
 		if segment.min != nil {
-			sel["_id"] = bson.M{
-				"$gte": segment.min,
-			}
+			sel["_id"] = bson.M{"$gte": segment.min}
 		}
-		err = c.Find(sel).Select(pro).Sort("_id").Skip(segmentSize).One(&doc)
+
+		err = c.FindOne(context.Background(), sel, opts).Decode(&doc)
+
 		if err == nil {
 			segment.max = doc.Id
 		} else {
 			done = true
 		}
+
 		ctx.allWg.Add(1)
 		ctx.DirectReadWg.Add(1)
-		go DirectReadSegment(ctx, session, ns, options, segment, stats)
+		ctx.directReadConcWg.Add(1)
+		go DirectReadSegment(ctx, client, ns, o, segment, stats)
+
 		if !done {
 			segment = &CollectionSegment{
 				splitKey: "_id",
@@ -1419,14 +1309,15 @@ func DirectReadPaged(ctx *OpCtx, session *mgo.Session, ns string, options *Optio
 				done = true
 				ctx.allWg.Add(1)
 				ctx.DirectReadWg.Add(1)
-				go DirectReadSegment(ctx, session, ns, options, segment, stats)
+				ctx.directReadConcWg.Add(1)
+				go DirectReadSegment(ctx, client, ns, o, segment, stats)
 			}
 		}
 	}
 	return
 }
 
-func FetchDocuments(ctx *OpCtx, session *mgo.Session, filter OpFilter, buf *OpBuf, inOp OpChan, options *Options) error {
+func FetchDocuments(ctx *OpCtx, client *mongo.Client, filter OpFilter, buf *OpBuf, inOp OpChan, options *Options) error {
 	defer ctx.allWg.Done()
 	timer := time.NewTimer(buf.BufferDuration)
 	timer.Stop()
@@ -1435,7 +1326,7 @@ func FetchDocuments(ctx *OpCtx, session *mgo.Session, filter OpFilter, buf *OpBu
 		case <-ctx.stopC:
 			return nil
 		case <-timer.C:
-			buf.Flush(session, ctx, options)
+			buf.Flush(client, ctx, options)
 		case op := <-inOp:
 			if op == nil {
 				break
@@ -1444,7 +1335,7 @@ func FetchDocuments(ctx *OpCtx, session *mgo.Session, filter OpFilter, buf *OpBu
 				buf.Append(op)
 				if buf.IsFull() {
 					timer.Stop()
-					buf.Flush(session, ctx, options)
+					buf.Flush(client, ctx, options)
 				} else if buf.HasOne() {
 					if !timer.Stop() {
 						select {
@@ -1498,9 +1389,8 @@ func DefaultOptions() *Options {
 		After:               LastOpTimestamp,
 		Filter:              nil,
 		NamespaceFilter:     nil,
-		OpLogDatabaseName:   &defaultOpLogDatabaseName,
-		OpLogCollectionName: &defaultOpLogCollectionName,
-		OpLogDisabled:       false,
+		OpLogDatabaseName:   "local",
+		OpLogCollectionName: "oplog.rs",
 		ChannelSize:         2048,
 		BufferSize:          50,
 		BufferDuration:      time.Duration(75) * time.Millisecond,
@@ -1510,16 +1400,16 @@ func DefaultOptions() *Options {
 		UpdateDataAsDelta:   false,
 		DirectReadNs:        []string{},
 		DirectReadFilter:    nil,
-		DirectReadSplitMax:  9,
+		DirectReadSplitMax:  150,
+		DirectReadConcur:    0,
 		Unmarshal:           defaultUnmarshaller,
-		SplitVector:         false,
 		Log:                 log.New(os.Stdout, "INFO ", log.Flags()),
 	}
 }
 
-func defaultUnmarshaller(namespace string, raw *bson.Raw) (interface{}, error) {
+func defaultUnmarshaller(namespace string, cursor mongo.Cursor) (interface{}, error) {
 	var m map[string]interface{}
-	if err := raw.Unmarshal(&m); err == nil {
+	if err := cursor.Decode(&m); err == nil {
 		return m, nil
 	} else {
 		return nil, err
@@ -1553,16 +1443,23 @@ func (this *Options) SetDefaults() {
 	if this.Log == nil {
 		this.Log = defaultOpts.Log
 	}
-	if this.DirectReadSplitMax < 1 {
+	if this.DirectReadConcur == 0 {
+		this.DirectReadConcur = defaultOpts.DirectReadConcur
+	}
+	if this.DirectReadSplitMax == 0 {
 		this.DirectReadSplitMax = defaultOpts.DirectReadSplitMax
 	}
-	if this.After == nil && len(this.ChangeStreamNs) == 0 {
-		this.After = defaultOpts.After
+	if len(this.ChangeStreamNs) == 0 {
+		if this.After == nil {
+			this.After = defaultOpts.After
+		}
+	} else {
+		this.OpLogDisabled = true
 	}
-	if this.OpLogDatabaseName == nil {
+	if this.OpLogDatabaseName == "" {
 		this.OpLogDatabaseName = defaultOpts.OpLogDatabaseName
 	}
-	if this.OpLogCollectionName == nil {
+	if this.OpLogCollectionName == "" {
 		this.OpLogCollectionName = defaultOpts.OpLogCollectionName
 	}
 	if this.MaxWaitSecs == 0 {
@@ -1570,38 +1467,12 @@ func (this *Options) SetDefaults() {
 	}
 }
 
-func Tail(session *mgo.Session, options *Options) (OpChan, chan error) {
-	ctx := Start(session, options)
+func Tail(client *mongo.Client, options *Options) (OpChan, chan error) {
+	ctx := Start(client, options)
 	return ctx.OpC, ctx.ErrC
 }
 
-func GetShards(session *mgo.Session) (shardInfos []*ShardInfo) {
-	// use this for sharded databases to get the shard hosts
-	// use the hostnames to create multiple sessions for a call to StartMulti
-	col := session.DB("config").C("shards")
-	var shards []map[string]interface{}
-	col.Find(nil).All(&shards)
-	for _, shard := range shards {
-		host := shard["host"].(string)
-		shardInfo := &ShardInfo{
-			hostname: host,
-		}
-		shardInfos = append(shardInfos, shardInfo)
-	}
-	return
-}
-
-func VersionInfo(session *mgo.Session) (buildInfo *BuildInfo, err error) {
-	if info, err := session.BuildInfo(); err == nil {
-		buildInfo = &BuildInfo{
-			version: info.VersionArray,
-		}
-		buildInfo.build()
-	}
-	return
-}
-
-func StartMulti(sessions []*mgo.Session, options *Options) *OpCtxMulti {
+func StartMulti(clients []*mongo.Client, options *Options) *OpCtxMulti {
 	if options == nil {
 		options = DefaultOptions()
 	} else {
@@ -1613,8 +1484,8 @@ func StartMulti(sessions []*mgo.Session, options *Options) *OpCtxMulti {
 	opC := make(OpChan, options.ChannelSize)
 
 	var directReadWg sync.WaitGroup
-	var opWg sync.WaitGroup
 	var allWg sync.WaitGroup
+	var seekC = make(chan primitive.Timestamp, 1)
 	var pauseC = make(chan bool, 1)
 	var resumeC = make(chan bool, 1)
 
@@ -1623,39 +1494,36 @@ func StartMulti(sessions []*mgo.Session, options *Options) *OpCtxMulti {
 		OpC:          opC,
 		ErrC:         errC,
 		DirectReadWg: &directReadWg,
-		opWg:         &opWg,
 		stopC:        stopC,
 		allWg:        &allWg,
 		pauseC:       pauseC,
 		resumeC:      resumeC,
+		seekC:        seekC,
 		log:          options.Log,
 	}
 
 	ctxMulti.lock.Lock()
 	defer ctxMulti.lock.Unlock()
 
-	for _, session := range sessions {
-		ctx := Start(session, options)
+	for _, client := range clients {
+		ctx := Start(client, options)
 		ctxMulti.contexts = append(ctxMulti.contexts, ctx)
-		allWg.Add(1)
 		directReadWg.Add(1)
-		opWg.Add(2)
 		go func() {
 			defer directReadWg.Done()
 			ctx.DirectReadWg.Wait()
 		}()
+		allWg.Add(1)
 		go func() {
 			defer allWg.Done()
 			ctx.allWg.Wait()
 		}()
 		go func(c OpChan) {
-			defer opWg.Done()
 			for op := range c {
 				opC <- op
 			}
 		}(ctx.OpC)
 		go func(c chan error) {
-			defer opWg.Done()
 			for err := range c {
 				errC <- err
 			}
@@ -1664,7 +1532,7 @@ func StartMulti(sessions []*mgo.Session, options *Options) *OpCtxMulti {
 	return ctxMulti
 }
 
-func Start(session *mgo.Session, options *Options) *OpCtx {
+func Start(client *mongo.Client, options *Options) *OpCtx {
 	if options == nil {
 		options = DefaultOptions()
 	} else {
@@ -1678,34 +1546,36 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 	var inOps []OpChan
 	var workerNames []string
 	var directReadWg sync.WaitGroup
+	var directReadConcWg sync.WaitGroup
 	var allWg sync.WaitGroup
+
 	streams := len(options.ChangeStreamNs)
 	if options.OpLogDisabled == false {
 		streams += 1
 	}
-	var seekC = make(chan bson.MongoTimestamp, streams)
+
+	var seekC = make(chan primitive.Timestamp, streams)
 	var pauseC = make(chan bool, streams)
 	var resumeC = make(chan bool, streams)
 
 	ctx := &OpCtx{
-		lock:         &sync.Mutex{},
-		OpC:          opC,
-		ErrC:         errC,
-		DirectReadWg: &directReadWg,
-		stopC:        stopC,
-		allWg:        &allWg,
-		pauseC:       pauseC,
-		resumeC:      resumeC,
-		seekC:        seekC,
-		log:          options.Log,
-		streams:      streams,
+		lock:             &sync.Mutex{},
+		OpC:              opC,
+		ErrC:             errC,
+		DirectReadWg:     &directReadWg,
+		directReadConcWg: &directReadConcWg,
+		stopC:            stopC,
+		allWg:            &allWg,
+		pauseC:           pauseC,
+		resumeC:          resumeC,
+		seekC:            seekC,
+		log:              options.Log,
 	}
 
 	if options.OpLogDisabled == false {
 		for i := 1; i <= options.WorkerCount; i++ {
 			workerNames = append(workerNames, strconv.Itoa(i))
 		}
-
 		for i := 1; i <= options.WorkerCount; i++ {
 			allWg.Add(1)
 			inOp := make(OpChan, options.ChannelSize)
@@ -1716,28 +1586,24 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 			}
 			worker := strconv.Itoa(i)
 			filter := OpFilterForOrdering(options.Ordering, workerNames, worker)
-			go FetchDocuments(ctx, session, filter, buf, inOp, options)
+			go FetchDocuments(ctx, client, filter, buf, inOp, options)
 		}
 	}
 
-	for _, ns := range options.DirectReadNs {
+	if len(options.DirectReadNs) > 0 {
 		directReadWg.Add(1)
 		allWg.Add(1)
-		if options.SplitVector {
-			go DirectReadSplitVector(ctx, session, ns, options)
-		} else {
-			go DirectReadPaged(ctx, session, ns, options)
-		}
+		go ProcessDirectReads(ctx, client, options)
 	}
 
 	for _, ns := range options.ChangeStreamNs {
 		allWg.Add(1)
-		go ConsumeChangeStream(ctx, session, ns, options)
+		go ConsumeChangeStream(ctx, client, ns, options)
 	}
 
 	if options.OpLogDisabled == false {
 		allWg.Add(1)
-		go TailOps(ctx, session, inOps, options)
+		go TailOps(ctx, client, inOps, options)
 	}
 
 	return ctx

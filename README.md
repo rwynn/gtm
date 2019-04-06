@@ -1,17 +1,21 @@
 gtm
 ===
-gtm (go tail mongo) is a utility written in Go which tails the MongoDB oplog and sends create, update, delete events to your code.
+gtm (go tail mongo) is a utility written in Go which tails the MongoDB oplog and 
+sends create, update, delete events to your code.
 It can be used to send emails to new users, [index documents](https://www.github.com/rwynn/monstache), 
 [write time series data](https://www.github.com/rwynn/mongofluxd), or something else.
 
+This branch, `leafny`, is a port of the original gtm to use the new official golang driver from MongoDB. 
+The original gtm uses the community mgo driver.
+
 ### Requirements ###
 + [Go](http://golang.org/doc/install)
-+ [globalsign/mgo](https://godoc.org/github.com/globalsign/mgo), a mongodb driver for Go
++ [mongodb go driver version 1.0.0](https://github.com/mongodb/mongo-go-driver)
 + [mongodb](http://www.mongodb.org/)
 
 ### Installation ###
 
-	go get github.com/rwynn/gtm
+	go get github.com/rwynn/gtm@leafny
 
 ### Setup ###
 
@@ -29,52 +33,51 @@ validate your replica set. For local testing your replica set may contain a
 ```golang
 package main
 
-import "github.com/globalsign/mgo"
-import "github.com/globalsign/mgo/bson"
-import "github.com/rwynn/gtm"
-import "fmt"
+import (
+	"context"
+	"fmt"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/bsontype"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"github.com/rwynn/gtm"
+	"reflect"
+	"time"
+)
 
 func main() {
-	// get a mgo session	
-	session, err := mgo.Dial("localhost")
+	rb := bson.NewRegistryBuilder()
+	//rb.RegisterTypeMapEntry(bsontype.Timestamp, reflect.TypeOf(time.Time{}))
+	rb.RegisterTypeMapEntry(bsontype.DateTime, reflect.TypeOf(time.Time{}))
+	reg := rb.Build()
+	clientOptions := options.Client()
+	clientOptions.SetRegistry(reg)
+	clientOptions.ApplyURI("mongodb://localhost:27017")
+	client, err := mongo.NewClient(clientOptions)
 	if err != nil {
 		panic(err)
 	}
-	defer session.Close()
-	session.SetMode(mgo.Monotonic, true)
-	// nil options get initialized to gtm.DefaultOptions()
-	ctx := gtm.Start(session, nil)
-	// ctx.OpC is a channel to read ops from
-	// ctx.ErrC is a channel to read errors from
-	// ctx.Stop() stops all go routines started by gtm.Start
+	ctxm, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	err = client.Connect(ctxm)
+	if err != nil {
+		panic(err)
+	}
+	defer client.Disconnect(context.Background())
+	ctx := gtm.Start(client, &gtm.Options{
+		DirectReadNs: []string{"test.test"},
+		ChangeStreamNs: []string{"test.test"},
+		MaxWaitSecs: 10,
+		OpLogDisabled: true,
+	})
 	for {
-		// loop forever receiving events	
 		select {
 		case err := <-ctx.ErrC:
-			// handle errors
-			fmt.Println(err)
+			fmt.Printf("got err %+v", err)
+			break
 		case op := <-ctx.OpC:
-			// op will be an insert, delete, update, or drop to mongo
-			// you can check which by calling 
-			// op.IsInsert(), op.IsDelete(), op.IsUpdate(), or op.IsDrop()
-
-			// op.Data will get you the full document for inserts and updates
-
-			// op.UpdateDescription will get you a map describing the set of changes
-			// as shown in https://docs.mongodb.com/manual/reference/change-events/#update-event
-			// op.UpdateDescription will only be available when you update docs via $set, $push, $unset, etc.
-			// if you replace the entire document using an update command, then you will NOT get
-			// information in op.UpdateDescription. e.g. db.update(doc, {total: "replace"});
-
-			msg := fmt.Sprintf(`Got op <%v> for object <%v> 
-			in database <%v> 
-			and collection <%v> 
-			and data <%v> 
-			and change <%v> 
-			and timestamp <%v>`,
-				op.Operation, op.Id, op.GetDatabase(),
-				op.GetCollection(), op.Data, op.UpdateDescription, op.Timestamp)
-			fmt.Println(msg) // or do something more interesting
+			fmt.Printf("got op %+v", op)
+			break
 		}
 	}
 }
@@ -125,11 +128,11 @@ func NewUsers(op *gtm.Op) bool {
 
 // if you want to listen only for certain events on certain collections
 // pass a filter function in options
-ctx := gtm.Start(session, &gtm.Options{
+ctx := gtm.Start(client, &gtm.Options{
 	NamespaceFilter: NewUsers, // only receive inserts in the user collection
 })
 // more options are available for tuning
-ctx := gtm.Start(session, &gtm.Options{
+ctx := gtm.Start(client, &gtm.Options{
 	NamespaceFilter      nil,           // op filter function that has access to type/ns ONLY
 	Filter               nil,           // op filter function that has access to type/ns/data
 	After:               nil,     	    // if nil defaults to gtm.LastOpTimestamp; not yet supported for ChangeStreamNS
@@ -142,11 +145,10 @@ ctx := gtm.Start(session, &gtm.Options{
 	WorkerCount:         8,             // defaults to 1. number of go routines batch fetching concurrently
 	Ordering:            gtm.Document,  // defaults to gtm.Oplog. ordering guarantee of events on the output channel as compared to the oplog
 	UpdateDataAsDelta:   false,         // set to true to only receive delta information in the Data field on updates (info straight from oplog)
-	DirectReadNs:        []string{"db.users"}, // set to a slice of namespaces to read data directly from bypassing the oplog
+	DirectReadNs:        []string{"db.users"}, // set to a slice of namespaces (collections or views) to read data directly from
 	DirectReadSplitMax:  9,             // the max number of times to split a collection for concurrent reads (impacts memory consumption)
 	Pipe:                PipeBuilder,   // an optional function to build aggregation pipelines
 	PipeAllowDisk:       false,         // true to allow MongoDB to use disk for aggregation pipeline options with large result sets
-	SplitVector:         false,         // whether or not to use internal MongoDB command split vector to split collections
 	Log:                 myLogger,      // pass your own logger
 	ChangeStreamNs       []string{"db.col1", "db.col2"}, // MongoDB 3.6+ only; set to a slice to namespaces to read via MongoDB change streams
 })
@@ -188,61 +190,6 @@ go func() {
 }
 ```
 
-### Sharded Clusters ###
-
-If you use `ChangeStreamNs` on MongoDB 3.6+ you can ignore this section.  Native change streams in MongoDB are shard aware.  You should connect to the
-`mongos` routing server and change streams will work across shards.  This section is for those pre-3.6 that would like to read changes across all shards.
-
-gtm has support for sharded MongoDB clusters.  You will want to start with a connection to the MongoDB config server to get the list of available shards.
-
-```golang
-// assuming the CONFIG server for a sharded cluster is running locally on port 27018
-configSession, err = mgo.Dial("127.0.0.1:27018")
-if err != nil {
-panic(err)
-}
-// get the list of shard servers
-shardInfos := gtm.GetShards(configSession)
-```
-
-for each shard you will create a session and append it to a slice of sessions
-
-```golang
-var shardSessions []*mgo.Session
-// add each shard server to the sync list
-for _, shardInfo := range shardInfos {
-log.Printf("Adding shard found at %s\n", shardInfo.GetURL())
-shardURL := shardInfo.GetURL()
-shard, err := mgo.Dial(shardURL)
-if err != nil {
-    panic(err)
-}
-shardSessions = append(shardSessions, shard)
-}
-```
-
-finally you will want to start a multi context.  The multi context behaves just like a single
-context except that it tails multiple shard servers and coalesces the events to a single output
-channel
-
-```golang
-multiCtx := gtm.StartMulti(shardSessions, nil)
-```
-
-after you have created the multi context for all the shards you can handle new shards being added
-to the cluster at some later time by adding a listener. You will want to add this listener before 
-you enter a loop to read events from the multi context.
-
-```golang
-insertHandler := func(shardInfo *gtm.ShardInfo) (*mgo.Session, error) {
-	log.Printf("Adding shard found at %s\n", shardInfo.GetURL())
-shardURL := shardInfo.GetURL()
-return mgo.Dial(shardURL)
-}
-
-multiCtx.AddShardListener(configSession, nil, insertHandler)
-```
-
 ### Custom Unmarshalling ###
 
 If you'd like to unmarshall MongoDB documents into your own struct instead of the document getting
@@ -267,7 +214,7 @@ func custom(namespace string, raw *bson.Raw) (interface{}, error) {
 	return nil, errors.New("unsupported namespace")
 }
 
-ctx := gtm.Start(session, &gtm.Options{
+ctx := gtm.Start(client, &gtm.Options{
 	Unmarshal: custom,
 }
 
@@ -313,7 +260,7 @@ if filterErr != nil {
 Pass the filter into the options when calling gtm.Tail
 
 ```golang
-ctx := gtm.Start(session, &gtm.Options{Filter: filter})
+ctx := gtm.Start(client, &gtm.Options{Filter: filter})
 ```
 
 If you have your multiple filters you can use the gtm utility method ChainOpFilters
@@ -321,27 +268,3 @@ If you have your multiple filters you can use the gtm utility method ChainOpFilt
 ```golang
 func ChainOpFilters(filters ...OpFilter) OpFilter
 ```
-
-### Optimizing Direct Read Throughput with SplitVector enabled ###
-
-If you enable SplitVector, to get the best througput possible on direct reads you will want to consider the indexes on your collections.  In the best
-case scenario, for very large collections, you will have an index on a field with a moderately low cardinality.
-For example, if you have 10 million documents in your collection and have a field named `category` that will have a
-value between 1 and 20, and you have an index of this field, then gtm will be able to perform an `internal` MongoDB admin
-command named `splitVector` on this key.  The results of the split vector command will return a sorted list of category split points.
-Once gtm has the split points it is able to start splits+1 go routines with range queries to consume the entire collection concurrently. 
-You will notice a line in the log like this is this is working.
-
-	INFO 2018/04/24 18:23:23 Found 16 splits (17 segments) for namespace test.test using index on category
-
-When this is working you will notice the connection count increase substancially in `mongostat`.  On the other hand, if you
-do not have an index which yields a high number splits, gtm will force a split and it will only be able to start 2 go 
-routines to read your collection concurrently. 
-
-The user that gtm connects with will need to have admin access to perform the `splitVector` command.  If the user does not have
-this access then gtm will use paginating range read of each collection.
-
-Gtm previously supported the `parallelCollectionScan` command to get multiple read cursors on a collection.
-However, this command only worked on the mmapv1 storage engine and will be `removed` completely once the mmapv1 engine is retired.
-It looks like `splitVector` or something like it will be promoted in new versions on MongoDB.  
-
