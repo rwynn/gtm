@@ -522,12 +522,12 @@ func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardIn
 			shardInfo := &ShardInfo{
 				hostname: op.Data["host"].(string),
 			}
-			shardSession, err := handler(shardInfo)
+			shardClient, err := handler(shardInfo)
 			if err != nil {
 				multi.ErrC <- errors.Wrap(err, "Error calling shard handler")
 				continue
 			}
-			shardCtx := Start(shardSession, options)
+			shardCtx := Start(shardClient, options)
 			multi.lock.Lock()
 			multi.contexts = append(multi.contexts, shardCtx)
 			multi.DirectReadWg.Add(1)
@@ -852,13 +852,9 @@ func TailOps(ctx *OpCtx, client *mongo.Client, channels []OpChan, o *Options) er
 	var err error
 	var cts primitive.Timestamp
 	if o.After != nil {
-		cts, err = o.After(client, o)
+		cts, _ = o.After(client, o)
 	} else {
-		cts, err = LastOpTimestamp(client, o)
-	}
-	if err != nil {
-		ctx.ErrC <- errors.Wrap(err, "Error finding timestamp in oplog")
-		return err
+		cts, _ = LastOpTimestamp(client, o)
 	}
 	var cursor *mongo.Cursor
 restart:
@@ -917,9 +913,7 @@ retry:
 			<-ctx.resumeC
 			select {
 			case <-ctx.stopC:
-				if err = cursor.Close(context.Background()); err != nil {
-					ctx.ErrC <- errors.Wrap(err, "Error closing the oplog cursor")
-				}
+				cursor.Close(context.Background())
 				return nil
 			case ts := <-ctx.seekC:
 				cts = ts
@@ -948,10 +942,11 @@ retry:
 				case <-ctx.stopC:
 					cursor.Close(context.Background())
 					return nil
+				case ts := <-ctx.seekC:
+					cts = ts
+					goto restart
 				case <-ctx.resumeC:
 					goto restart
-				case <-ctx.stopC:
-					return nil
 				}
 			default:
 				goto retry
@@ -1535,6 +1530,31 @@ func (this *Options) SetDefaults() {
 func Tail(client *mongo.Client, options *Options) (OpChan, chan error) {
 	ctx := Start(client, options)
 	return ctx.OpC, ctx.ErrC
+}
+
+func GetShards(client *mongo.Client) (shardInfos []*ShardInfo) {
+	// use this for sharded databases to get the shard hosts
+	// use the hostnames to create multiple clients for a call to StartMulti
+	col := client.Database("config").Collection("shards")
+	opts := &options.FindOptions{}
+	cursor, err := col.Find(context.Background(), nil, opts)
+	if err != nil {
+		return
+	}
+	for cursor.Next(context.Background()) {
+		shard := map[string]interface{}{}
+		if err = cursor.Decode(&shard); err != nil {
+			continue
+		}
+		if shard["host"] == nil {
+			continue
+		}
+		shardInfo := &ShardInfo{
+			hostname: shard["host"].(string),
+		}
+		shardInfos = append(shardInfos, shardInfo)
+	}
+	return
 }
 
 func StartMulti(clients []*mongo.Client, options *Options) *OpCtxMulti {
