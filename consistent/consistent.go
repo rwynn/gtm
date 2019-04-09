@@ -6,7 +6,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/rwynn/gtm"
 	"github.com/serialx/hashring"
-	"go.mongodb.org/mongo-driver/bson/objectid"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 type ConfigOptions struct {
@@ -64,8 +64,8 @@ func ConsistentHashFilter(name string, workers []string) (gtm.OpFilter, error) {
 		if op.Id != nil {
 			var idStr string
 			switch op.Id.(type) {
-			case objectid.ObjectID:
-				idStr = op.Id.(objectid.ObjectID).Hex()
+			case primitive.ObjectID:
+				idStr = op.Id.(primitive.ObjectID).Hex()
 			default:
 				idStr = fmt.Sprintf("%v", op.Id)
 			}
