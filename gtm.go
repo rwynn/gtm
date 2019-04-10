@@ -221,14 +221,14 @@ func (cs *CollectionSegment) init(c *mongo.Collection) (err error) {
 	opts := &options.FindOneOptions{}
 	opts.SetSort(bson.M{cs.splitKey: 1})
 	doc := make(map[string]interface{})
-	if err = c.FindOne(context.Background(), nil, opts).Decode(doc); err != nil {
+	if err = c.FindOne(context.Background(), nil, opts).Decode(&doc); err != nil {
 		return
 	}
 	cs.min = doc[cs.splitKey]
 	opts = &options.FindOneOptions{}
 	opts.SetSort(bson.M{cs.splitKey: -1})
 	doc = make(map[string]interface{})
-	if err = c.FindOne(context.Background(), nil, opts).Decode(doc); err != nil {
+	if err = c.FindOne(context.Background(), nil, opts).Decode(&doc); err != nil {
 		return
 	}
 	cs.max = doc[cs.splitKey]
@@ -711,7 +711,7 @@ retry:
 		if err == nil {
 			for cursor.Next(context.Background()) {
 				doc := make(map[string]interface{})
-				if err = cursor.Decode(doc); err == nil {
+				if err = cursor.Decode(&doc); err == nil {
 					resultId := fmt.Sprintf("%s.%v", n, doc["_id"])
 					if ops, ok := byId[resultId]; ok {
 						for _, o := range ops {
@@ -1180,6 +1180,7 @@ restart:
 				goto restart
 			}
 		}
+		ctx.log.Printf("Watching changes on %s", n.desc())
 	retry:
 		tctx, cancel := context.WithTimeout(context.Background(), time.Duration(o.MaxWaitSecs)*time.Second)
 		for stream.Next(tctx) {
@@ -1375,7 +1376,7 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 
 		err = c.FindOne(context.Background(), sel, opts).Decode(&doc)
 
-		if err == nil {
+		if err == nil && doc.Id != nil {
 			segment.max = doc.Id
 		} else {
 			done = true
