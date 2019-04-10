@@ -1214,6 +1214,8 @@ restart:
 					ctx.OpC <- op
 				}
 			} else if changeDoc.isInvalidate() {
+				resumeAfter = nil
+				startAt = nil
 				stream.Close(context.Background())
 				time.Sleep(time.Duration(5) * time.Second)
 				goto restart
