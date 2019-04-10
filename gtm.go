@@ -482,6 +482,14 @@ func positionLost(ec errchk) bool {
 	return false
 }
 
+func cursorTimeout(ec errchk) bool {
+	err := ec.Err()
+	if et, ok := err.(net.Error); ok {
+		return et.Timeout() || et.Temporary()
+	}
+	return false
+}
+
 func invalidCursor(ec errchk) bool {
 	err := ec.Err()
 	if err != nil {
@@ -952,8 +960,16 @@ retry:
 	}
 	err = tctx.Err()
 	cancel()
-	if err != nil {
-		if err == context.DeadlineExceeded || err == context.Canceled {
+	if err == context.DeadlineExceeded || err == context.Canceled {
+		select {
+		case <-ctx.stopC:
+			cursor.Close(context.Background())
+			return nil
+		case ts := <-ctx.seekC:
+			cts = ts
+			goto restart
+		case <-ctx.pauseC:
+			cursor.Close(context.Background())
 			select {
 			case <-ctx.stopC:
 				cursor.Close(context.Background())
@@ -961,22 +977,15 @@ retry:
 			case ts := <-ctx.seekC:
 				cts = ts
 				goto restart
-			case <-ctx.pauseC:
-				cursor.Close(context.Background())
-				select {
-				case <-ctx.stopC:
-					cursor.Close(context.Background())
-					return nil
-				case ts := <-ctx.seekC:
-					cts = ts
-					goto restart
-				case <-ctx.resumeC:
-					goto restart
-				}
-			default:
-				goto retry
+			case <-ctx.resumeC:
+				goto restart
 			}
+		default:
+			goto retry
 		}
+	}
+	if cursorTimeout(cursor) {
+		goto retry
 	}
 	if invalidCursor(cursor) {
 		if positionLost(cursor) {
@@ -986,12 +995,8 @@ retry:
 		goto restart
 	}
 	if err = cursor.Err(); err != nil {
-		if et, ok := err.(net.Error); ok && et.Timeout() {
-			goto retry
-		} else {
-			cursor.Close(context.Background())
-			goto restart
-		}
+		cursor.Close(context.Background())
+		goto restart
 	}
 	goto retry
 	return nil
@@ -1265,52 +1270,42 @@ restart:
 		}
 		err = tctx.Err()
 		cancel()
-		if err != nil {
-			if err == context.DeadlineExceeded || err == context.Canceled {
+		if err == context.DeadlineExceeded || err == context.Canceled {
+			select {
+			case <-ctx.stopC:
+				stream.Close(context.Background())
+				return
+			case ts := <-ctx.seekC:
+				resumeAfter = nil
+				startAt = &ts
+				stream.Close(context.Background())
+				goto restart
+			case <-ctx.pauseC:
+				stream.Close(context.Background())
 				select {
-				case <-ctx.stopC:
-					stream.Close(context.Background())
-					return
-				case ts := <-ctx.seekC:
-					resumeAfter = nil
-					startAt = &ts
-					stream.Close(context.Background())
+				case <-ctx.resumeC:
 					goto restart
-				case <-ctx.pauseC:
-					stream.Close(context.Background())
-					select {
-					case <-ctx.resumeC:
-						goto restart
-					case <-ctx.stopC:
-						return
-					}
-				default:
-					goto retry
+				case <-ctx.stopC:
+					return
 				}
-			} else {
-				ctx.ErrC <- errors.Wrap(err, "Error consuming change stream. Will retry.")
+			default:
+				goto retry
 			}
+		}
+		if cursorTimeout(stream) {
+			goto retry
 		}
 		if invalidCursor(stream) {
 			if positionLost(stream) {
 				resumeAfter = nil
 				startAt = nil
 			}
-			if err = stream.Close(context.Background()); err != nil {
-				ctx.ErrC <- errors.Wrap(err, "Error closing change stream.")
-			}
+			stream.Close(context.Background())
 			goto restart
 		}
 		if err = stream.Err(); err != nil {
-			if et, ok := err.(net.Error); ok && et.Timeout() {
-				goto retry
-			} else {
-				ctx.ErrC <- errors.Wrap(err, "Error consuming change stream. Will retry.")
-				if err = stream.Close(context.Background()); err != nil {
-					ctx.ErrC <- errors.Wrap(err, "Error closing change stream.")
-				}
-				goto restart
-			}
+			stream.Close(context.Background())
+			goto restart
 		}
 		goto retry
 	}
