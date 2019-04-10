@@ -277,6 +277,7 @@ type OpCtxMulti struct {
 	OpC          OpChan
 	ErrC         chan error
 	DirectReadWg *sync.WaitGroup
+	opWg         *sync.WaitGroup
 	stopC        chan bool
 	allWg        *sync.WaitGroup
 	seekC        chan primitive.Timestamp
@@ -414,6 +415,8 @@ func (ctx *OpCtx) Stop() {
 		ctx.stopped = true
 		close(ctx.stopC)
 		ctx.allWg.Wait()
+		close(ctx.OpC)
+		close(ctx.ErrC)
 	}
 }
 
@@ -460,6 +463,9 @@ func (ctx *OpCtxMulti) Stop() {
 			go child.Stop()
 		}
 		ctx.allWg.Wait()
+		ctx.opWg.Wait()
+		close(ctx.OpC)
+		close(ctx.ErrC)
 	}
 }
 
@@ -510,44 +516,63 @@ func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardIn
 		case <-multi.stopC:
 			return
 		case <-multi.pauseC:
-			<-multi.resumeC
 			select {
 			case <-multi.stopC:
 				return
+			case <-multi.resumeC:
+				break
 			}
 		case err := <-ctx.ErrC:
-			multi.ErrC <- errors.Wrap(err, "Error tailing shards")
+			if err == nil {
+				break
+			}
+			multi.ErrC <- err
 		case op := <-ctx.OpC:
+			if op == nil || op.Data == nil || op.Data["host"] == nil {
+				break
+			}
+			shardHost, ok := op.Data["host"].(string)
+			if !ok {
+				break
+			}
 			// new shard detected
+			multi.lock.Lock()
+			if multi.stopped {
+				multi.lock.Unlock()
+				break
+			}
 			shardInfo := &ShardInfo{
-				hostname: op.Data["host"].(string),
+				hostname: shardHost,
 			}
 			shardClient, err := handler(shardInfo)
 			if err != nil {
 				multi.ErrC <- errors.Wrap(err, "Error calling shard handler")
-				continue
+				multi.lock.Unlock()
+				break
 			}
 			shardCtx := Start(shardClient, options)
-			multi.lock.Lock()
 			multi.contexts = append(multi.contexts, shardCtx)
 			multi.DirectReadWg.Add(1)
+			multi.allWg.Add(1)
+			multi.opWg.Add(2)
 			go func() {
 				defer multi.DirectReadWg.Done()
 				shardCtx.DirectReadWg.Wait()
 			}()
-			multi.allWg.Add(1)
 			go func() {
 				defer multi.allWg.Done()
 				shardCtx.allWg.Wait()
 			}()
 			go func(c OpChan) {
+				defer multi.opWg.Done()
 				for op := range c {
 					multi.OpC <- op
 				}
 			}(shardCtx.OpC)
 			go func(c chan error) {
+				defer multi.opWg.Done()
 				for err := range c {
-					multi.ErrC <- errors.Wrap(err, "Error tailing shards")
+					multi.ErrC <- err
 				}
 			}(shardCtx.ErrC)
 			multi.lock.Unlock()
@@ -1569,6 +1594,7 @@ func StartMulti(clients []*mongo.Client, options *Options) *OpCtxMulti {
 	opC := make(OpChan, options.ChannelSize)
 
 	var directReadWg sync.WaitGroup
+	var opWg sync.WaitGroup
 	var allWg sync.WaitGroup
 	var seekC = make(chan primitive.Timestamp, 1)
 	var pauseC = make(chan bool, 1)
@@ -1579,6 +1605,7 @@ func StartMulti(clients []*mongo.Client, options *Options) *OpCtxMulti {
 		OpC:          opC,
 		ErrC:         errC,
 		DirectReadWg: &directReadWg,
+		opWg:         &opWg,
 		stopC:        stopC,
 		allWg:        &allWg,
 		pauseC:       pauseC,
@@ -1593,22 +1620,25 @@ func StartMulti(clients []*mongo.Client, options *Options) *OpCtxMulti {
 	for _, client := range clients {
 		ctx := Start(client, options)
 		ctxMulti.contexts = append(ctxMulti.contexts, ctx)
+		allWg.Add(1)
 		directReadWg.Add(1)
+		opWg.Add(2)
 		go func() {
 			defer directReadWg.Done()
 			ctx.DirectReadWg.Wait()
 		}()
-		allWg.Add(1)
 		go func() {
 			defer allWg.Done()
 			ctx.allWg.Wait()
 		}()
 		go func(c OpChan) {
+			defer opWg.Done()
 			for op := range c {
 				opC <- op
 			}
 		}(ctx.OpC)
 		go func(c chan error) {
+			defer opWg.Done()
 			for err := range c {
 				errC <- err
 			}
