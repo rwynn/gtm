@@ -292,29 +292,9 @@ type ShardInfo struct {
 	hostname string
 }
 
-type BuildInfo struct {
-	version []int
-	major   int
-	minor   int
-	patch   int
-}
-
 type N struct {
 	database   string
 	collection string
-}
-
-func (b *BuildInfo) build() {
-	parts := len(b.version)
-	if parts > 0 {
-		b.major = b.version[0]
-	}
-	if parts > 1 {
-		b.minor = b.version[1]
-	}
-	if parts > 2 {
-		b.patch = b.version[2]
-	}
 }
 
 func (n *N) parse(ns string) (err error) {
