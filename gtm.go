@@ -352,9 +352,9 @@ func (n *N) isCollection() bool {
 func (shard *ShardInfo) GetURL() string {
 	hostParts := strings.SplitN(shard.hostname, "/", 2)
 	if len(hostParts) == 2 {
-		return hostParts[1] + "?replicaSet=" + hostParts[0]
+		return "mongodb://" + hostParts[1] + "?replicaSet=" + hostParts[0]
 	} else {
-		return hostParts[0]
+		return "mongodb://" + hostParts[0]
 	}
 }
 
