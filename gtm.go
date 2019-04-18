@@ -118,8 +118,7 @@ type Optime struct {
 }
 
 type ReplStatus struct {
-	LastStableCheckpointTimestamp bson.MongoTimestamp "lastStableCheckpointTimestamp"
-	Optimes                       map[string]*Optime  "optimes"
+	Optimes map[string]*Optime "optimes"
 }
 
 type watchable interface {
