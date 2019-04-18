@@ -113,6 +113,15 @@ type ChangeDoc struct {
 	UpdateDescription *bson.Raw              "updateDescription"
 }
 
+type Optime struct {
+	Timestamp bson.MongoTimestamp "ts"
+}
+
+type ReplStatus struct {
+	LastStableCheckpointTimestamp bson.MongoTimestamp "lastStableCheckpointTimestamp"
+	Optimes                       map[string]*Optime  "optimes"
+}
+
 type watchable interface {
 	Watch(pipeline interface{}, options mgo.ChangeStreamOptions) (*mgo.ChangeStream, error)
 }
@@ -1863,4 +1872,27 @@ func Start(session *mgo.Session, options *Options) *OpCtx {
 	}
 
 	return ctx
+}
+
+func (rs *ReplStatus) GetLastCommitted() (ts bson.MongoTimestamp, err error) {
+	if rs.Optimes != nil {
+		ot := rs.Optimes["lastCommittedOpTime"]
+		if ot != nil && ot.Timestamp > 0 {
+			ts = ot.Timestamp
+			return
+		}
+	}
+	err = fmt.Errorf("lastCommittedOpTime not found")
+	return
+}
+
+func GetReplStatus(session *mgo.Session) (*ReplStatus, error) {
+	s := session.Copy()
+	defer s.Close()
+	cmd := bson.M{
+		"replSetGetStatus": 1,
+	}
+	var rs ReplStatus
+	err := s.Run(cmd, &rs)
+	return &rs, err
 }
