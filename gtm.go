@@ -75,6 +75,15 @@ type Op struct {
 	UpdateDescription map[string]interface{} `json:"updateDescription,omitempty`
 }
 
+type Optime struct {
+	Timestamp primitive.Timestamp "ts"
+}
+
+type ReplStatus struct {
+	LastStableCheckpointTimestamp primitive.Timestamp "lastStableCheckpointTimestamp"
+	Optimes                       map[string]*Optime  "optimes"
+}
+
 type OpLog struct {
 	Timestamp    primitive.Timestamp    "ts"
 	HistoryID    int64                  "h"
@@ -1055,15 +1064,11 @@ retry:
 		if et, ok := err.(net.Error); ok && et.Timeout() {
 			goto retry
 		} else {
-			ctx.ErrC <- errors.Wrap(err, fmt.Sprintf(`
-            Error performing direct read of collection %s
-            `, ns))
+			ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error performing direct read of collection %s", ns))
 		}
 	}
 	if err = cursor.Close(context.Background()); err != nil {
-		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf(`
-        Error closing direct read cursor of collection %s. Will retry segment.
-        `, ns))
+		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error closing direct read cursor of collection %s. Will retry segment", ns))
 		ctx.allWg.Add(1)
 		ctx.DirectReadWg.Add(1)
 		go DirectReadSegment(ctx, client, ns, o, seg, stats)
@@ -1304,9 +1309,7 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 	var stats *CollectionStats
 	stats, err = GetCollectionStats(ctx, client, ns)
 	if err != nil {
-		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf(`
-		Error reading collection stats for %s. Used to calibrate batch size.
-		`, ns))
+		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error reading collection stats for %s", ns))
 	}
 	c := client.Database(n.database).Collection(n.collection)
 	const defaultSegmentSize = 50000
@@ -1700,4 +1703,28 @@ func Start(client *mongo.Client, options *Options) *OpCtx {
 	}
 
 	return ctx
+}
+
+func (rs *ReplStatus) GetLastCommitted() (ts primitive.Timestamp, err error) {
+	if rs.Optimes != nil {
+		ot := rs.Optimes["lastCommittedOpTime"]
+		if ot != nil && ot.Timestamp.T > 0 {
+			ts = ot.Timestamp
+			return
+		}
+	}
+	err = fmt.Errorf("lastCommittedOpTime not found")
+	return
+}
+
+func GetReplStatus(client *mongo.Client) (rs *ReplStatus, err error) {
+	db := client.Database("admin")
+	result := db.RunCommand(context.Background(), bson.M{
+		"replSetGetStatus": 1,
+	})
+	if err = result.Err(); err == nil {
+		rs = &ReplStatus{}
+		err = result.Decode(rs)
+	}
+	return
 }
