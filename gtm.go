@@ -80,8 +80,7 @@ type Optime struct {
 }
 
 type ReplStatus struct {
-	LastStableCheckpointTimestamp primitive.Timestamp "lastStableCheckpointTimestamp"
-	Optimes                       map[string]*Optime  "optimes"
+	Optimes map[string]*Optime "optimes"
 }
 
 type OpLog struct {
