@@ -1375,7 +1375,7 @@ restart:
 					Source:    OplogQuerySource,
 					Timestamp: changeDoc.mapTimestamp(),
 				}
-				op.Data = map[string]interface{}{"drop": n.collection}
+				op.Data = map[string]interface{}{"drop": changeDoc.Namespace.Collection}
 				if op.matchesNsFilter(options) {
 					ctx.OpC <- op
 				}
@@ -1386,7 +1386,7 @@ restart:
 					Source:    OplogQuerySource,
 					Timestamp: changeDoc.mapTimestamp(),
 				}
-				op.Data = map[string]interface{}{"dropDatabase": n.database}
+				op.Data = map[string]interface{}{"dropDatabase": changeDoc.Namespace.Database}
 				if op.matchesNsFilter(options) {
 					ctx.OpC <- op
 				}
