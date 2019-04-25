@@ -117,8 +117,12 @@ func (cd *ChangeDoc) mapTimestamp() primitive.Timestamp {
 		// only supported in version 4.0
 		return cd.Timestamp
 	} else {
-		t := time.Now().UTC().Unix()
-		return primitive.Timestamp{T: uint32(t << 32)}
+		// for versions prior to 4.0 simulate a timestamp
+		now := time.Now().UTC()
+		return primitive.Timestamp{
+			T: uint32(now.Unix()),
+			I: uint32(now.Nanosecond()),
+		}
 	}
 }
 
