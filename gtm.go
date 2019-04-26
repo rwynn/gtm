@@ -1317,14 +1317,6 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 	c := client.Database(n.database).Collection(n.collection)
 	const defaultSegmentSize = 50000
 	var maxSplits int32 = o.DirectReadSplitMax
-	var segmentSize int32 = defaultSegmentSize
-	if stats.Count != 0 {
-		segmentSize = stats.Count / (maxSplits + 1)
-		if segmentSize < defaultSegmentSize {
-			segmentSize = defaultSegmentSize
-		}
-	}
-
 	segment := &CollectionSegment{
 		splitKey: "_id",
 	}
@@ -1334,6 +1326,13 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 		ctx.directReadConcWg.Add(1)
 		go DirectReadSegment(ctx, client, ns, o, segment, stats)
 		return
+	}
+	var segmentSize int32 = defaultSegmentSize
+	if stats.Count != 0 {
+		segmentSize = stats.Count / (maxSplits + 1)
+		if segmentSize < defaultSegmentSize {
+			segmentSize = defaultSegmentSize
+		}
 	}
 	var doc Doc
 	var splitCount int32
