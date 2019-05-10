@@ -61,6 +61,7 @@ type Options struct {
 	DirectReadConcur    int
 	Unmarshal           DataUnmarshaller
 	Pipe                PipelineBuilder
+	PipeAllowDisk       bool
 	Log                 *log.Logger
 }
 
@@ -1011,14 +1012,45 @@ func DirectReadSegment(ctx *OpCtx, client *mongo.Client, ns string, o *Options, 
 			batch = 0
 		}
 	}
-	opts := &options.FindOptions{}
-	if batch != 0 {
-		opts.SetBatchSize(batch)
-	}
 	c := client.Database(n.database).Collection(n.collection)
 	sel := seg.toSelector()
-	cursor, err := c.Find(context.Background(), sel, opts)
+	var cursor *mongo.Cursor
+	if o.Pipe != nil {
+		var pipeline []interface{}
+		if pipeline, err = o.Pipe(ns, false); err != nil {
+			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline stages.")
+			return
+		}
+		if pipeline != nil && len(pipeline) > 0 {
+			var stages []interface{}
+			stages = append(stages, bson.M{"$match": sel})
+			for _, stage := range pipeline {
+				stages = append(stages, stage)
+			}
+			opts := options.Aggregate()
+			if batch != 0 {
+				opts.SetBatchSize(batch)
+			}
+			if o.PipeAllowDisk {
+				opts.SetAllowDiskUse(true)
+			}
+			cursor, err = c.Aggregate(context.Background(), stages, opts)
+		} else {
+			opts := options.Find()
+			if batch != 0 {
+				opts.SetBatchSize(batch)
+			}
+			cursor, err = c.Find(context.Background(), sel, opts)
+		}
+	} else {
+		opts := options.Find()
+		if batch != 0 {
+			opts.SetBatchSize(batch)
+		}
+		cursor, err = c.Find(context.Background(), sel, opts)
+	}
 	if err != nil {
+		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error performing direct read of collection %s", ns))
 		return
 	}
 retry:
