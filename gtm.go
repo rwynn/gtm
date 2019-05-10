@@ -9,6 +9,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/x/network/connection"
 	"log"
 	"net"
 	"os"
@@ -462,8 +463,20 @@ func (ctx *OpCtxMulti) Stop() {
 	}
 }
 
+func unwrapErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if ce, ok := err.(connection.Error); ok {
+		if ce.Wrapped != nil {
+			return unwrapErr(ce.Wrapped)
+		}
+	}
+	return err
+}
+
 func positionLost(ec errchk) bool {
-	err := ec.Err()
+	err := unwrapErr(ec.Err())
 	if err != nil {
 		if ce, ok := err.(mongo.CommandError); ok {
 			code := ce.Code
@@ -476,7 +489,7 @@ func positionLost(ec errchk) bool {
 }
 
 func cursorTimeout(ec errchk) bool {
-	err := ec.Err()
+	err := unwrapErr(ec.Err())
 	if et, ok := err.(net.Error); ok {
 		return et.Timeout() || et.Temporary()
 	}
@@ -484,7 +497,7 @@ func cursorTimeout(ec errchk) bool {
 }
 
 func invalidCursor(ec errchk) bool {
-	err := ec.Err()
+	err := unwrapErr(ec.Err())
 	if err != nil {
 		if ce, ok := err.(mongo.CommandError); ok {
 			code := ce.Code
@@ -894,7 +907,6 @@ restart:
 		ctx.ErrC <- errors.Wrap(err, "Error establishing the oplog cursor")
 		goto restart
 	}
-retry:
 	tctx, cancel := context.WithTimeout(context.Background(), time.Duration(o.MaxWaitSecs)*time.Second)
 	for cursor.Next(tctx) {
 		var entry OpLog
@@ -951,47 +963,30 @@ retry:
 			cts = op.Timestamp
 		}
 	}
-	err = tctx.Err()
 	cancel()
-	if err == context.DeadlineExceeded || err == context.Canceled {
+	cursor.Close(context.Background())
+	select {
+	case <-ctx.stopC:
+		return nil
+	case ts := <-ctx.seekC:
+		cts = ts
+		goto restart
+	case <-ctx.pauseC:
 		select {
 		case <-ctx.stopC:
-			cursor.Close(context.Background())
 			return nil
 		case ts := <-ctx.seekC:
 			cts = ts
 			goto restart
-		case <-ctx.pauseC:
-			cursor.Close(context.Background())
-			select {
-			case <-ctx.stopC:
-				cursor.Close(context.Background())
-				return nil
-			case ts := <-ctx.seekC:
-				cts = ts
-				goto restart
-			case <-ctx.resumeC:
-				goto restart
-			}
-		default:
-			goto retry
+		case <-ctx.resumeC:
+			goto restart
 		}
-	}
-	if cursorTimeout(cursor) {
-		goto retry
-	}
-	if invalidCursor(cursor) {
+	default:
 		if positionLost(cursor) {
 			cts, _ = FirstOpTimestamp(client, o)
 		}
-		cursor.Close(context.Background())
 		goto restart
 	}
-	if err = cursor.Err(); err != nil {
-		cursor.Close(context.Background())
-		goto restart
-	}
-	goto retry
 	return nil
 }
 
@@ -1151,6 +1146,7 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 	defer ctx.allWg.Done()
 	n := &N{}
 	n.parseForChanges(ns)
+	ctx.log.Printf("Watching changes on %s", n.desc())
 	var pipeline []interface{}
 	var startAt *primitive.Timestamp
 	var resumeAfter interface{}
@@ -1205,17 +1201,15 @@ restart:
 				goto restart
 			}
 		}
-		ctx.log.Printf("Watching changes on %s", n.desc())
-	retry:
 		tctx, cancel := context.WithTimeout(context.Background(), time.Duration(o.MaxWaitSecs)*time.Second)
 		for stream.Next(tctx) {
-			startAt = nil
 			var changeDoc ChangeDoc
 			if err = stream.Decode(&changeDoc); err != nil {
 				ctx.ErrC <- errors.Wrap(err, "Error decoding change doc.")
 				break
 			}
 			resumeAfter = changeDoc.Id
+			startAt = nil
 			oper := changeDoc.mapOperation()
 			if changeDoc.isDrop() {
 				op := &Op{
@@ -1288,46 +1282,29 @@ restart:
 				continue
 			}
 		}
-		err = tctx.Err()
 		cancel()
-		if err == context.DeadlineExceeded || err == context.Canceled {
+		stream.Close(context.Background())
+		select {
+		case <-ctx.stopC:
+			return
+		case ts := <-ctx.seekC:
+			resumeAfter = nil
+			startAt = &ts
+			goto restart
+		case <-ctx.pauseC:
 			select {
-			case <-ctx.stopC:
-				stream.Close(context.Background())
-				return
-			case ts := <-ctx.seekC:
-				resumeAfter = nil
-				startAt = &ts
-				stream.Close(context.Background())
+			case <-ctx.resumeC:
 				goto restart
-			case <-ctx.pauseC:
-				stream.Close(context.Background())
-				select {
-				case <-ctx.resumeC:
-					goto restart
-				case <-ctx.stopC:
-					return
-				}
-			default:
-				goto retry
+			case <-ctx.stopC:
+				return
 			}
-		}
-		if cursorTimeout(stream) {
-			goto retry
-		}
-		if invalidCursor(stream) {
+		default:
 			if positionLost(stream) {
 				resumeAfter = nil
 				startAt = nil
 			}
-			stream.Close(context.Background())
 			goto restart
 		}
-		if err = stream.Err(); err != nil {
-			stream.Close(context.Background())
-			goto restart
-		}
-		goto retry
 	}
 	return nil
 }
