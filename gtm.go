@@ -1097,12 +1097,7 @@ retry:
 			ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error performing direct read of collection %s", ns))
 		}
 	}
-	if err = cursor.Close(context.Background()); err != nil {
-		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error closing direct read cursor of collection %s. Will retry segment", ns))
-		ctx.allWg.Add(1)
-		ctx.DirectReadWg.Add(1)
-		go DirectReadSegment(ctx, client, ns, o, seg, stats)
-	}
+	cursor.Close(context.Background())
 	return
 }
 
@@ -1319,10 +1314,7 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 		return
 	}
 	var stats *CollectionStats
-	stats, err = GetCollectionStats(ctx, client, ns)
-	if err != nil {
-		ctx.ErrC <- errors.Wrap(err, fmt.Sprintf("Error reading collection stats for %s", ns))
-	}
+	stats, _ = GetCollectionStats(ctx, client, ns)
 	c := client.Database(n.database).Collection(n.collection)
 	const defaultSegmentSize = 50000
 	var maxSplits int32 = o.DirectReadSplitMax
