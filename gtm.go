@@ -1294,7 +1294,7 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 	var doc Doc
 	var splitCount int32
 
-	pro := bson.M{"id": 1}
+	pro := bson.M{"_id": 1}
 
 	done := false
 
