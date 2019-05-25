@@ -1272,7 +1272,6 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 	var stats *CollectionStats
 	stats, _ = GetCollectionStats(ctx, client, ns)
 	c := client.Database(n.database).Collection(n.collection)
-	const defaultSegmentSize = 50000
 	var maxSplits int32 = o.DirectReadSplitMax
 	segment := &CollectionSegment{
 		splitKey: "_id",
@@ -1284,6 +1283,7 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 		go DirectReadSegment(ctx, client, ns, o, segment, stats)
 		return
 	}
+	const defaultSegmentSize = 50000
 	var segmentSize int32 = defaultSegmentSize
 	if stats.Count != 0 {
 		segmentSize = stats.Count / (maxSplits + 1)
@@ -1291,17 +1291,9 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 			segmentSize = defaultSegmentSize
 		}
 	}
-	var doc Doc
 	var splitCount int32
 
-	pro := bson.M{"_id": 1}
-
 	done := false
-
-	opts := &options.FindOneOptions{}
-	opts.SetSort(bson.M{"_id": 1})
-	opts.SetProjection(pro)
-	opts.SetSkip(int64(segmentSize))
 
 	task := newTask(ctx.stopC)
 	defer task.Done()
@@ -1314,13 +1306,31 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 			sel["_id"] = bson.M{"$gte": segment.min}
 		}
 
-		err = c.FindOne(task.ctx, sel, opts).Decode(&doc)
-
-		if err == nil && doc.Id != nil {
-			segment.max = doc.Id
-		} else {
-			done = true
+		stages := []bson.M{
+			{"$match": sel},
+			{"$skip": segmentSize},
+			{"$limit": 1},
+			{"$project": bson.M{"_id": 1}},
 		}
+
+		opts := options.Aggregate()
+		opts.SetAllowDiskUse(o.PipeAllowDisk)
+
+		hasMax := false
+		var cursor *mongo.Cursor
+		cursor, err = c.Aggregate(task.ctx, stages, opts)
+		if err == nil {
+			if cursor.Next(task.ctx) {
+				var doc Doc
+				cursor.Decode(&doc)
+				if doc.Id != nil {
+					segment.max = doc.Id
+					hasMax = true
+				}
+			}
+			cursor.Close(task.ctx)
+		}
+		done = !hasMax
 
 		ctx.allWg.Add(1)
 		ctx.DirectReadWg.Add(1)
