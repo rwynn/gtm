@@ -3,6 +3,9 @@
 *.a
 *.so
 
+# Swap files
+*.swp
+
 # Folders
 _obj
 _test

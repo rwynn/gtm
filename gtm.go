@@ -1095,6 +1095,14 @@ func GetCollectionStats(ctx *OpCtx, client *mongo.Client, ns string) (stats *Col
 	if err == nil {
 		err = result.Decode(stats)
 	}
+	if stats.Count == 0 {
+		var count int64
+		col := client.Database(n.database).Collection(n.collection)
+		count, err = col.EstimatedDocumentCount(context.Background())
+		if err == nil {
+			stats.Count = int32(count)
+		}
+	}
 	return
 }
 
@@ -1284,11 +1292,16 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 		return
 	}
 	const defaultSegmentSize = 50000
+	const minSegmentSize = 5000
 	var segmentSize int32 = defaultSegmentSize
 	if stats.Count != 0 {
 		segmentSize = stats.Count / (maxSplits + 1)
-		if segmentSize < defaultSegmentSize {
-			segmentSize = defaultSegmentSize
+		if segmentSize < minSegmentSize {
+			ctx.allWg.Add(1)
+			ctx.DirectReadWg.Add(1)
+			ctx.directReadConcWg.Add(1)
+			go DirectReadSegment(ctx, client, ns, o, segment, stats)
+			return
 		}
 	}
 	var splitCount int32
