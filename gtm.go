@@ -1321,6 +1321,7 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 
 		stages := []bson.M{
 			{"$match": sel},
+			{"$sort": bson.M{"_id": 1}},
 			{"$skip": segmentSize},
 			{"$limit": 1},
 			{"$project": bson.M{"_id": 1}},
