@@ -810,11 +810,56 @@ func (this *Op) matchesDirectFilter(options *Options) bool {
 	return options.DirectReadFilter == nil || options.DirectReadFilter(this)
 }
 
+func normalizeDocSlice(a []interface{}) []interface{} {
+	var avs []interface{}
+	for _, av := range a {
+		var avc interface{}
+		switch achild := av.(type) {
+		case map[string]interface{}:
+			avc = normalizeDocMap(achild)
+		case primitive.M:
+			avc = normalizeDocMap(map[string]interface{}(achild))
+		case primitive.D:
+			avc = normalizeDocMap(map[string]interface{}(achild.Map()))
+		case []interface{}:
+			avc = normalizeDocSlice(achild)
+		case primitive.A:
+			avc = normalizeDocSlice([]interface{}(achild))
+		default:
+			avc = av
+		}
+		avs = append(avs, avc)
+	}
+	return avs
+}
+
+func normalizeDocMap(m map[string]interface{}) map[string]interface{} {
+	o := map[string]interface{}{}
+	for k, v := range m {
+		switch child := v.(type) {
+		case map[string]interface{}:
+			o[k] = normalizeDocMap(child)
+		case primitive.M:
+			o[k] = normalizeDocMap(map[string]interface{}(child))
+		case primitive.D:
+			o[k] = normalizeDocMap(map[string]interface{}(child.Map()))
+		case []interface{}:
+			o[k] = normalizeDocSlice(child)
+		case primitive.A:
+			o[k] = normalizeDocSlice([]interface{}(child))
+		default:
+			o[k] = v
+		}
+	}
+	return o
+}
+
 func (this *Op) processData(data interface{}) {
 	if data != nil {
 		this.Doc = data
 		if m, ok := data.(map[string]interface{}); ok {
-			this.Data = m
+			this.Data = normalizeDocMap(m)
+			this.Doc = this.Data
 		}
 	}
 }
@@ -1160,7 +1205,6 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 		var stream *mongo.ChangeStream
 		opts := options.ChangeStream()
 		opts.SetBatchSize(int32(o.ChannelSize))
-		opts.SetMaxAwaitTime(time.Duration(o.MaxWaitSecs) * time.Second)
 		opts.SetFullDocument(options.UpdateLookup)
 		opts.SetStartAtOperationTime(startAt)
 		opts.SetResumeAfter(resumeAfter)
