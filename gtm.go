@@ -292,7 +292,7 @@ type ShardInsertHandler func(*ShardInfo) (*mongo.Client, error)
 
 type TimestampGenerator func(*mongo.Client, *Options) (primitive.Timestamp, error)
 
-type DataUnmarshaller func(namespace string, cursor mongo.Cursor) (interface{}, error)
+type DataUnmarshaller func(namespace string, data []byte) (interface{}, error)
 
 type PipelineBuilder func(namespace string, changeStream bool) ([]interface{}, error)
 
@@ -551,12 +551,12 @@ func invalidCursor(ec errchk) bool {
 	return false
 }
 
-func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardInsertHandler) {
+func tailShards(multi *OpCtxMulti, ctx *OpCtx, o *Options, handler ShardInsertHandler) {
 	defer multi.allWg.Done()
-	if options == nil {
-		options = DefaultOptions()
+	if o == nil {
+		o = DefaultOptions()
 	} else {
-		options.SetDefaults()
+		o.SetDefaults()
 	}
 	for {
 		select {
@@ -597,7 +597,7 @@ func tailShards(multi *OpCtxMulti, ctx *OpCtx, options *Options, handler ShardIn
 				multi.lock.Unlock()
 				break
 			}
-			shardCtx := Start(shardClient, options)
+			shardCtx := Start(shardClient, o)
 			multi.contexts = append(multi.contexts, shardCtx)
 			multi.DirectReadWg.Add(1)
 			multi.allWg.Add(1)
@@ -735,7 +735,7 @@ func (this *OpBuf) HasOne() bool {
 	return len(this.Entries) == 1
 }
 
-func (this *OpBuf) Flush(client *mongo.Client, ctx *OpCtx, options *Options) {
+func (this *OpBuf) Flush(client *mongo.Client, ctx *OpCtx, o *Options) {
 	if len(this.Entries) == 0 {
 		return
 	}
@@ -761,8 +761,8 @@ retry:
 				if err = cursor.Decode(&doc); err == nil {
 					resultId := fmt.Sprintf("%s.%v", n, doc["_id"])
 					if ops, ok := byId[resultId]; ok {
-						for _, o := range ops {
-							o.processData(doc)
+						for _, op := range ops {
+							op.processData(doc, o)
 						}
 					}
 
@@ -777,7 +777,7 @@ retry:
 		}
 	}
 	for _, op := range this.Entries {
-		if op.matchesFilter(options) {
+		if op.matchesFilter(o) {
 			ctx.OpC <- op
 		}
 	}
@@ -798,16 +798,16 @@ func (this *Op) shouldParse() bool {
 	return this.IsInsert() || this.IsDelete() || this.IsUpdate() || this.IsCommand()
 }
 
-func (this *Op) matchesNsFilter(options *Options) bool {
-	return options.NamespaceFilter == nil || options.NamespaceFilter(this)
+func (this *Op) matchesNsFilter(o *Options) bool {
+	return o.NamespaceFilter == nil || o.NamespaceFilter(this)
 }
 
-func (this *Op) matchesFilter(options *Options) bool {
-	return options.Filter == nil || options.Filter(this)
+func (this *Op) matchesFilter(o *Options) bool {
+	return o.Filter == nil || o.Filter(this)
 }
 
-func (this *Op) matchesDirectFilter(options *Options) bool {
-	return options.DirectReadFilter == nil || options.DirectReadFilter(this)
+func (this *Op) matchesDirectFilter(o *Options) bool {
+	return o.DirectReadFilter == nil || o.DirectReadFilter(this)
 }
 
 func normalizeDocSlice(a []interface{}) []interface{} {
@@ -854,17 +854,36 @@ func normalizeDocMap(m map[string]interface{}) map[string]interface{} {
 	return o
 }
 
-func (this *Op) processData(data interface{}) {
+func (this *Op) processData(data interface{}, o *Options) {
 	if data != nil {
 		this.Doc = data
 		if m, ok := data.(map[string]interface{}); ok {
 			this.Data = normalizeDocMap(m)
 			this.Doc = this.Data
+			if o.Unmarshal != nil {
+				this.processDoc(data, o)
+			}
 		}
 	}
 }
 
-func (this *Op) ParseLogEntry(entry *OpLog, options *Options) (include bool, err error) {
+func (this *Op) processDoc(data interface{}, o *Options) {
+	if o.Unmarshal == nil || data == nil {
+		return
+	}
+	b, err := bson.Marshal(data)
+	if err == nil {
+		this.Doc, err = o.Unmarshal(this.Namespace, b)
+		if err != nil {
+			o.Log.Printf("Unable to process document: %s", err)
+		}
+	} else {
+		o.Log.Printf("Unable to process document: %s", err)
+	}
+	return
+}
+
+func (this *Op) ParseLogEntry(entry *OpLog, o *Options) (include bool, err error) {
 	var rawField map[string]interface{}
 	this.Operation = entry.Operation
 	this.Timestamp = entry.Timestamp
@@ -872,9 +891,9 @@ func (this *Op) ParseLogEntry(entry *OpLog, options *Options) (include bool, err
 	if this.shouldParse() {
 		if this.IsCommand() {
 			rawField = entry.Doc
-			this.processData(rawField)
+			this.processData(rawField, o)
 		}
-		if this.matchesNsFilter(options) {
+		if this.matchesNsFilter(o) {
 			if this.IsInsert() || this.IsDelete() || this.IsUpdate() {
 				if this.IsUpdate() {
 					rawField = entry.Update
@@ -883,11 +902,11 @@ func (this *Op) ParseLogEntry(entry *OpLog, options *Options) (include bool, err
 				}
 				this.Id = rawField["_id"]
 				if this.IsInsert() {
-					this.processData(rawField)
+					this.processData(rawField, o)
 				} else if this.IsUpdate() {
 					rawField = entry.Doc
-					if options.UpdateDataAsDelta || UpdateIsReplace(rawField) {
-						this.processData(rawField)
+					if o.UpdateDataAsDelta || UpdateIsReplace(rawField) {
+						this.processData(rawField, o)
 					}
 				}
 				include = true
@@ -899,13 +918,13 @@ func (this *Op) ParseLogEntry(entry *OpLog, options *Options) (include bool, err
 	return
 }
 
-func OpLogCollectionName(client *mongo.Client, options *Options) string {
+func OpLogCollectionName(client *mongo.Client, o *Options) string {
 	return "oplog.rs"
 }
 
-func OpLogCollection(client *mongo.Client, options *Options) *mongo.Collection {
-	localDB := client.Database(options.OpLogDatabaseName)
-	return localDB.Collection(options.OpLogCollectionName)
+func OpLogCollection(client *mongo.Client, o *Options) *mongo.Collection {
+	localDB := client.Database(o.OpLogDatabaseName)
+	return localDB.Collection(o.OpLogCollectionName)
 }
 
 func ParseTimestamp(timestamp primitive.Timestamp) (uint32, uint32) {
@@ -951,10 +970,10 @@ func GetOpLogCursor(client *mongo.Client, after primitive.Timestamp, o *Options)
 	return collection.Find(context.Background(), query, opts)
 }
 
-func opDataReady(op *Op, options *Options) (ready bool) {
-	if options.UpdateDataAsDelta {
+func opDataReady(op *Op, o *Options) (ready bool) {
+	if o.UpdateDataAsDelta {
 		ready = true
-	} else if options.Ordering == AnyOrder {
+	} else if o.Ordering == AnyOrder {
 		if op.IsUpdate() {
 			ready = op.Data != nil || op.Doc != nil
 		} else {
@@ -1113,7 +1132,7 @@ func DirectReadSegment(ctx *OpCtx, client *mongo.Client, ns string, o *Options, 
 			Source:    DirectQuerySource,
 			Timestamp: primitive.Timestamp{T: uint32(t)},
 		}
-		op.processData(result)
+		op.processData(result, o)
 		if op.matchesDirectFilter(o) {
 			ctx.OpC <- op
 		}
@@ -1151,12 +1170,12 @@ func GetCollectionStats(ctx *OpCtx, client *mongo.Client, ns string) (stats *Col
 	return
 }
 
-func ProcessDirectReads(ctx *OpCtx, client *mongo.Client, options *Options) (err error) {
+func ProcessDirectReads(ctx *OpCtx, client *mongo.Client, o *Options) (err error) {
 	defer ctx.allWg.Done()
 	defer ctx.DirectReadWg.Done()
-	concur := options.DirectReadConcur
+	concur := o.DirectReadConcur
 	running := 0
-	for _, ns := range options.DirectReadNs {
+	for _, ns := range o.DirectReadNs {
 		if concur > 0 && running >= concur {
 			ctx.directReadConcWg.Wait()
 			running = 0
@@ -1164,7 +1183,7 @@ func ProcessDirectReads(ctx *OpCtx, client *mongo.Client, options *Options) (err
 		ctx.DirectReadWg.Add(1)
 		ctx.directReadConcWg.Add(1)
 		ctx.allWg.Add(1)
-		go DirectReadPaged(ctx, client, ns, options)
+		go DirectReadPaged(ctx, client, ns, o)
 		running = running + 1
 	}
 	return
@@ -1274,7 +1293,7 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 						op.UpdateDescription = changeDoc.UpdateDescription
 					}
 					if changeDoc.hasDoc() {
-						op.processData(changeDoc.FullDoc)
+						op.processData(changeDoc.FullDoc, o)
 						if op.matchesDirectFilter(o) {
 							ctx.OpC <- op
 						}
@@ -1413,7 +1432,7 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 	return
 }
 
-func FetchDocuments(ctx *OpCtx, client *mongo.Client, filter OpFilter, buf *OpBuf, inOp OpChan, options *Options) error {
+func FetchDocuments(ctx *OpCtx, client *mongo.Client, filter OpFilter, buf *OpBuf, inOp OpChan, o *Options) error {
 	defer ctx.allWg.Done()
 	timer := time.NewTimer(buf.BufferDuration)
 	timer.Stop()
@@ -1422,7 +1441,7 @@ func FetchDocuments(ctx *OpCtx, client *mongo.Client, filter OpFilter, buf *OpBu
 		case <-ctx.stopC:
 			return nil
 		case <-timer.C:
-			buf.Flush(client, ctx, options)
+			buf.Flush(client, ctx, o)
 		case op := <-inOp:
 			if op == nil {
 				break
@@ -1431,7 +1450,7 @@ func FetchDocuments(ctx *OpCtx, client *mongo.Client, filter OpFilter, buf *OpBu
 				buf.Append(op)
 				if buf.IsFull() {
 					timer.Stop()
-					buf.Flush(client, ctx, options)
+					buf.Flush(client, ctx, o)
 				} else if buf.HasOne() {
 					if !timer.Stop() {
 						select {
@@ -1498,7 +1517,7 @@ func DefaultOptions() *Options {
 		DirectReadFilter:    nil,
 		DirectReadSplitMax:  150,
 		DirectReadConcur:    0,
-		Unmarshal:           defaultUnmarshaller,
+		Unmarshal:           nil,
 		Log:                 log.New(os.Stdout, "INFO ", log.Flags()),
 	}
 }
@@ -1563,8 +1582,8 @@ func (this *Options) SetDefaults() {
 	}
 }
 
-func Tail(client *mongo.Client, options *Options) (OpChan, chan error) {
-	ctx := Start(client, options)
+func Tail(client *mongo.Client, o *Options) (OpChan, chan error) {
+	ctx := Start(client, o)
 	return ctx.OpC, ctx.ErrC
 }
 
@@ -1593,16 +1612,16 @@ func GetShards(client *mongo.Client) (shardInfos []*ShardInfo) {
 	return
 }
 
-func StartMulti(clients []*mongo.Client, options *Options) *OpCtxMulti {
-	if options == nil {
-		options = DefaultOptions()
+func StartMulti(clients []*mongo.Client, o *Options) *OpCtxMulti {
+	if o == nil {
+		o = DefaultOptions()
 	} else {
-		options.SetDefaults()
+		o.SetDefaults()
 	}
 
 	stopC := make(chan bool, 1)
-	errC := make(chan error, options.ChannelSize)
-	opC := make(OpChan, options.ChannelSize)
+	errC := make(chan error, o.ChannelSize)
+	opC := make(OpChan, o.ChannelSize)
 
 	var directReadWg sync.WaitGroup
 	var opWg sync.WaitGroup
@@ -1622,14 +1641,14 @@ func StartMulti(clients []*mongo.Client, options *Options) *OpCtxMulti {
 		pauseC:       pauseC,
 		resumeC:      resumeC,
 		seekC:        seekC,
-		log:          options.Log,
+		log:          o.Log,
 	}
 
 	ctxMulti.lock.Lock()
 	defer ctxMulti.lock.Unlock()
 
 	for _, client := range clients {
-		ctx := Start(client, options)
+		ctx := Start(client, o)
 		ctxMulti.contexts = append(ctxMulti.contexts, ctx)
 		allWg.Add(1)
 		directReadWg.Add(1)
@@ -1658,16 +1677,16 @@ func StartMulti(clients []*mongo.Client, options *Options) *OpCtxMulti {
 	return ctxMulti
 }
 
-func Start(client *mongo.Client, options *Options) *OpCtx {
-	if options == nil {
-		options = DefaultOptions()
+func Start(client *mongo.Client, o *Options) *OpCtx {
+	if o == nil {
+		o = DefaultOptions()
 	} else {
-		options.SetDefaults()
+		o.SetDefaults()
 	}
 
 	stopC := make(chan bool)
-	errC := make(chan error, options.ChannelSize)
-	opC := make(OpChan, options.ChannelSize)
+	errC := make(chan error, o.ChannelSize)
+	opC := make(OpChan, o.ChannelSize)
 
 	var inOps []OpChan
 	var workerNames []string
@@ -1675,8 +1694,8 @@ func Start(client *mongo.Client, options *Options) *OpCtx {
 	var directReadConcWg sync.WaitGroup
 	var allWg sync.WaitGroup
 
-	streams := len(options.ChangeStreamNs)
-	if options.OpLogDisabled == false {
+	streams := len(o.ChangeStreamNs)
+	if o.OpLogDisabled == false {
 		streams += 1
 	}
 
@@ -1695,41 +1714,41 @@ func Start(client *mongo.Client, options *Options) *OpCtx {
 		pauseC:           pauseC,
 		resumeC:          resumeC,
 		seekC:            seekC,
-		log:              options.Log,
+		log:              o.Log,
 	}
 
-	if options.OpLogDisabled == false {
-		for i := 1; i <= options.WorkerCount; i++ {
+	if o.OpLogDisabled == false {
+		for i := 1; i <= o.WorkerCount; i++ {
 			workerNames = append(workerNames, strconv.Itoa(i))
 		}
-		for i := 1; i <= options.WorkerCount; i++ {
+		for i := 1; i <= o.WorkerCount; i++ {
 			allWg.Add(1)
-			inOp := make(OpChan, options.ChannelSize)
+			inOp := make(OpChan, o.ChannelSize)
 			inOps = append(inOps, inOp)
 			buf := &OpBuf{
-				BufferSize:     options.BufferSize,
-				BufferDuration: options.BufferDuration,
+				BufferSize:     o.BufferSize,
+				BufferDuration: o.BufferDuration,
 			}
 			worker := strconv.Itoa(i)
-			filter := OpFilterForOrdering(options.Ordering, workerNames, worker)
-			go FetchDocuments(ctx, client, filter, buf, inOp, options)
+			filter := OpFilterForOrdering(o.Ordering, workerNames, worker)
+			go FetchDocuments(ctx, client, filter, buf, inOp, o)
 		}
 	}
 
-	if len(options.DirectReadNs) > 0 {
+	if len(o.DirectReadNs) > 0 {
 		directReadWg.Add(1)
 		allWg.Add(1)
-		go ProcessDirectReads(ctx, client, options)
+		go ProcessDirectReads(ctx, client, o)
 	}
 
-	for _, ns := range options.ChangeStreamNs {
+	for _, ns := range o.ChangeStreamNs {
 		allWg.Add(1)
-		go ConsumeChangeStream(ctx, client, ns, options)
+		go ConsumeChangeStream(ctx, client, ns, o)
 	}
 
-	if options.OpLogDisabled == false {
+	if o.OpLogDisabled == false {
 		allWg.Add(1)
-		go TailOps(ctx, client, inOps, options)
+		go TailOps(ctx, client, inOps, o)
 	}
 
 	return ctx
