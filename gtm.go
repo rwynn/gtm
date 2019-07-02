@@ -93,6 +93,7 @@ type Options struct {
 	DirectReadFilter    OpFilter
 	DirectReadSplitMax  int32
 	DirectReadConcur    int
+	DirectReadNoTimeout bool
 	Unmarshal           DataUnmarshaller
 	Pipe                PipelineBuilder
 	PipeAllowDisk       bool
@@ -1101,6 +1102,9 @@ func DirectReadSegment(ctx *OpCtx, client *mongo.Client, ns string, o *Options, 
 			cursor, err = c.Aggregate(task.ctx, stages, opts)
 		} else {
 			opts := options.Find()
+			if o.DirectReadNoTimeout {
+				opts.SetNoCursorTimeout(true)
+			}
 			if batch != 0 {
 				opts.SetBatchSize(batch)
 			}
@@ -1108,6 +1112,9 @@ func DirectReadSegment(ctx *OpCtx, client *mongo.Client, ns string, o *Options, 
 		}
 	} else {
 		opts := options.Find()
+		if o.DirectReadNoTimeout {
+			opts.SetNoCursorTimeout(true)
+		}
 		if batch != 0 {
 			opts.SetBatchSize(batch)
 		}
@@ -1517,6 +1524,7 @@ func DefaultOptions() *Options {
 		DirectReadFilter:    nil,
 		DirectReadSplitMax:  150,
 		DirectReadConcur:    0,
+		DirectReadNoTimeout: false,
 		Unmarshal:           nil,
 		Log:                 log.New(os.Stdout, "INFO ", log.Flags()),
 	}
