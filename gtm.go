@@ -861,9 +861,9 @@ func (this *Op) processData(data interface{}, o *Options) {
 		if m, ok := data.(map[string]interface{}); ok {
 			this.Data = normalizeDocMap(m)
 			this.Doc = this.Data
-			if o.Unmarshal != nil {
-				this.processDoc(data, o)
-			}
+		}
+		if o.Unmarshal != nil {
+			this.processDoc(data, o)
 		}
 	}
 }
