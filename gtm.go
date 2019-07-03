@@ -55,6 +55,7 @@ type Options struct {
 	DirectReadFilter    OpFilter
 	DirectReadSplitMax  int
 	DirectReadConcur    int
+	DirectReadNoTimeout bool
 	Unmarshal           DataUnmarshaller
 	Pipe                PipelineBuilder
 	PipeAllowDisk       bool
@@ -1169,6 +1170,9 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 	defer ctx.DirectReadWg.Done()
 	defer ctx.directReadConcWg.Done()
 	s := session.Copy()
+	if options.DirectReadNoTimeout {
+		s.SetCursorTimeout(0)
+	}
 	n := &N{}
 	if err = n.parse(ns); err != nil {
 		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
@@ -1266,6 +1270,9 @@ retry:
 			return
 		}
 		s = ctx.repairSession(s)
+		if options.DirectReadNoTimeout {
+			s.SetCursorTimeout(0)
+		}
 		goto restart
 	}
 	s.Close()
@@ -1640,6 +1647,7 @@ func DefaultOptions() *Options {
 		DirectReadFilter:    nil,
 		DirectReadSplitMax:  9,
 		DirectReadConcur:    0,
+		DirectReadNoTimeout: false,
 		Unmarshal:           defaultUnmarshaller,
 		SplitVector:         false,
 		Log:                 log.New(os.Stdout, "INFO ", log.Flags()),
