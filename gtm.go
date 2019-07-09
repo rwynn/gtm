@@ -1091,12 +1091,11 @@ func DirectReadSegment(ctx *OpCtx, session *mgo.Session, ns string, options *Opt
 		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
 		return
 	}
-	var batch int64 = 1000
+	var batch int64 = 500
 	if stats.AvgObjectSize != 0 {
-		batch = (8 * 1024 * 1024) / stats.AvgObjectSize // 8MB divided by avg doc size
-		if batch < 1000 {
-			// leave it up to the server
-			batch = 0
+		batch = (2 * 1024 * 1024) / stats.AvgObjectSize // 2MB divided by avg doc size
+		if batch < 500 {
+			batch = 500
 		}
 	}
 restart:
