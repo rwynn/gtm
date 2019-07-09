@@ -1069,12 +1069,11 @@ func DirectReadSegment(ctx *OpCtx, client *mongo.Client, ns string, o *Options, 
 		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
 		return
 	}
-	var batch int32 = 1000
+	var batch int32 = 500
 	if stats.AvgObjectSize != 0 {
-		batch = (8 * 1024 * 1024) / stats.AvgObjectSize // 8MB divided by avg doc size
-		if batch < 1000 {
-			// leave it up to the server
-			batch = 0
+		batch = (2 * 1024 * 1024) / stats.AvgObjectSize // 2MB divided by avg doc size
+		if batch < 500 {
+			batch = 500
 		}
 	}
 	c := client.Database(n.database).Collection(n.collection)
@@ -1364,6 +1363,7 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 	const defaultSegmentSize = 50000
 	const minSegmentSize = 5000
 	var segmentSize int32 = defaultSegmentSize
+
 	if stats.Count != 0 {
 		segmentSize = stats.Count / (maxSplits + 1)
 		if segmentSize < minSegmentSize {
@@ -1522,7 +1522,7 @@ func DefaultOptions() *Options {
 		UpdateDataAsDelta:   false,
 		DirectReadNs:        []string{},
 		DirectReadFilter:    nil,
-		DirectReadSplitMax:  150,
+		DirectReadSplitMax:  9,
 		DirectReadConcur:    0,
 		DirectReadNoTimeout: false,
 		Unmarshal:           nil,
