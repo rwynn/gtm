@@ -509,6 +509,10 @@ func unwrapErr(err error) error {
 	return err
 }
 
+func resumeFail(code int32) bool {
+	return code == 40576 || code == 40585 || code == 40615 || code == 260
+}
+
 func positionLost(ec errchk) bool {
 	err := unwrapErr(ec.Err())
 	if err != nil {
@@ -1066,7 +1070,7 @@ func DirectReadSegment(ctx *OpCtx, client *mongo.Client, ns string, o *Options, 
 	defer task.Done()
 	n := &N{}
 	if err = n.parse(ns); err != nil {
-		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
+		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace")
 		return
 	}
 	var batch int32 = 500
@@ -1082,7 +1086,7 @@ func DirectReadSegment(ctx *OpCtx, client *mongo.Client, ns string, o *Options, 
 	if o.Pipe != nil {
 		var pipeline []interface{}
 		if pipeline, err = o.Pipe(ns, false); err != nil {
-			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline stages.")
+			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline stages")
 			return
 		}
 		if pipeline != nil && len(pipeline) > 0 {
@@ -1155,7 +1159,7 @@ func GetCollectionStats(ctx *OpCtx, client *mongo.Client, ns string) (stats *Col
 	stats = &CollectionStats{}
 	n := &N{}
 	if err = n.parse(ns); err != nil {
-		ctx.ErrC <- errors.Wrap(err, "Error reading collection stats. Invalid namespace.")
+		ctx.ErrC <- errors.Wrap(err, "Error reading collection stats. Invalid namespace")
 		return
 	}
 	var result *mongo.SingleResult
@@ -1217,7 +1221,7 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 	if o.Pipe != nil {
 		var stages []interface{}
 		if stages, err = o.Pipe(ns, true); err != nil {
-			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline stages.")
+			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline stages")
 			return
 		}
 		if stages != nil && len(stages) > 0 {
@@ -1243,17 +1247,24 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 			stream, err = c.Watch(task.ctx, pipeline, opts)
 		}
 		if err != nil {
-			ctx.ErrC <- errors.Wrap(err, "Error starting change stream. Will retry.")
 			if stream != nil {
 				stream.Close(context.Background())
 			}
+			ce, isCommandErr := err.(mongo.CommandError)
+			if isCommandErr && resumeFail(ce.Code) {
+				ctx.ErrC <- errors.Wrap(err, "Error resuming change stream")
+				resumeAfter = nil
+				startAt = nil
+				continue
+			}
+			ctx.ErrC <- errors.Wrap(err, "Error starting change stream. Will retry")
 			continue
 		}
 		next := true
 		for next && stream.Next(task.ctx) {
 			var changeDoc ChangeDoc
 			if err = stream.Decode(&changeDoc); err != nil {
-				ctx.ErrC <- errors.Wrap(err, "Error decoding change doc.")
+				ctx.ErrC <- errors.Wrap(err, "Error decoding change doc")
 				break
 			}
 			resumeAfter = changeDoc.Id
