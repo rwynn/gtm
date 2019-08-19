@@ -10,7 +10,6 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/x/bsonx"
-	"go.mongodb.org/mongo-driver/x/network/connection"
 	"log"
 	"net"
 	"os"
@@ -494,24 +493,12 @@ func (ctx *OpCtxMulti) Stop() {
 	}
 }
 
-func unwrapErr(err error) error {
-	if err == nil {
-		return nil
-	}
-	if ce, ok := err.(connection.Error); ok {
-		if ce.Wrapped != nil {
-			return unwrapErr(ce.Wrapped)
-		}
-	}
-	return err
-}
-
 func resumeFail(code int32) bool {
 	return code == 40576 || code == 40585 || code == 40615 || code == 260
 }
 
 func positionLost(ec errchk) bool {
-	err := unwrapErr(ec.Err())
+	err := ec.Err()
 	if err != nil {
 		if ce, ok := err.(mongo.CommandError); ok {
 			code := ce.Code
@@ -524,7 +511,7 @@ func positionLost(ec errchk) bool {
 }
 
 func cursorTimeout(ec errchk) bool {
-	err := unwrapErr(ec.Err())
+	err := ec.Err()
 	if et, ok := err.(net.Error); ok {
 		return et.Timeout() || et.Temporary()
 	}
@@ -532,7 +519,7 @@ func cursorTimeout(ec errchk) bool {
 }
 
 func invalidCursor(ec errchk) bool {
-	err := unwrapErr(ec.Err())
+	err := ec.Err()
 	if err != nil {
 		if ce, ok := err.(mongo.CommandError); ok {
 			code := ce.Code
