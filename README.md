@@ -201,11 +201,11 @@ type MyDoc struct {
 	Foo string "foo"
 }
 
-func custom(namespace string, raw *bson.Raw) (interface{}, error) {
+func custom(namespace string, data []byte) (interface{}, error) {
 	// use namespace, e.g. db.col, to map to a custom struct
 	if namespace == "test.test" {
 		var doc MyDoc
-		if err := raw.Unmarshal(&doc); err == nil {
+		if err := bson.Unmarshal(data, &doc); err == nil {
 			return doc, nil
 		} else {
 			return nil, err
