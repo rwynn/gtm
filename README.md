@@ -5,17 +5,17 @@ sends create, update, delete events to your code.
 It can be used to send emails to new users, [index documents](https://www.github.com/rwynn/monstache), 
 [write time series data](https://www.github.com/rwynn/mongofluxd), or something else.
 
-This branch, `leafny`, is a port of the original gtm to use the new official golang driver from MongoDB. 
-The original gtm uses the community mgo driver.
+This branch is a port of the original gtm to use the new official golang driver from MongoDB.
+The original gtm uses the community mgo driver. To use the community mgo driver use the `legacy` branch.
 
 ### Requirements ###
 + [Go](http://golang.org/doc/install)
-+ [mongodb go driver version 1.0.0](https://github.com/mongodb/mongo-go-driver)
++ [mongodb go driver version 1.1.0](https://github.com/mongodb/mongo-go-driver)
 + [mongodb](http://www.mongodb.org/)
 
 ### Installation ###
 
-	go get github.com/rwynn/gtm@leafny
+	go get github.com/rwynn/gtm@master
 
 ### Setup ###
 
