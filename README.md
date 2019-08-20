@@ -10,7 +10,7 @@ The original gtm uses the community mgo driver.
 
 ### Requirements ###
 + [Go](http://golang.org/doc/install)
-+ [mongodb go driver version 1.0.0](https://github.com/mongodb/mongo-go-driver)
++ [mongodb go driver version 1.1.0](https://github.com/mongodb/mongo-go-driver)
 + [mongodb](http://www.mongodb.org/)
 
 ### Installation ###
