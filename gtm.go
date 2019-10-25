@@ -273,7 +273,7 @@ func (cs *CollectionSegment) setMin(ctx context.Context, c *mongo.Collection) (e
 	opts.SetSort(bson.M{cs.splitKey: 1})
 	opts.SetProjection(bson.M{cs.splitKey: 1})
 	doc := make(map[string]interface{})
-	if err = c.FindOne(ctx, nil, opts).Decode(&doc); err == nil {
+	if err = c.FindOne(ctx, bson.M{}, opts).Decode(&doc); err == nil {
 		cs.min = doc[cs.splitKey]
 	}
 	return
@@ -284,7 +284,7 @@ func (cs *CollectionSegment) setMax(ctx context.Context, c *mongo.Collection) (e
 	opts.SetSort(bson.M{cs.splitKey: -1})
 	opts.SetProjection(bson.M{cs.splitKey: 1})
 	doc := make(map[string]interface{})
-	if err = c.FindOne(ctx, nil, opts).Decode(&doc); err == nil {
+	if err = c.FindOne(ctx, bson.M{}, opts).Decode(&doc); err == nil {
 		cs.max = doc[cs.splitKey]
 	}
 	return
