@@ -87,7 +87,7 @@ type Options struct {
 	BufferDuration      time.Duration
 	Ordering            OrderingGuarantee
 	WorkerCount         int
-	MaxWaitSecs         int
+	MaxAwaitTime        time.Duration
 	UpdateDataAsDelta   bool
 	ChangeStreamNs      []string
 	DirectReadNs        []string
@@ -1257,6 +1257,9 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 		opts.SetFullDocument(options.UpdateLookup)
 		opts.SetStartAtOperationTime(startAt)
 		opts.SetResumeAfter(resumeAfter)
+		if o.MaxAwaitTime > time.Duration(0) {
+			opts.SetMaxAwaitTime(o.MaxAwaitTime)
+		}
 		if n.isDeployment() {
 			stream, err = client.Watch(task.ctx, pipeline, opts)
 		} else if n.isDatabase() {
@@ -1549,7 +1552,7 @@ func DefaultOptions() *Options {
 		BufferDuration:      time.Duration(75) * time.Millisecond,
 		Ordering:            Oplog,
 		WorkerCount:         10,
-		MaxWaitSecs:         10,
+		MaxAwaitTime:        time.Duration(0),
 		UpdateDataAsDelta:   false,
 		DirectReadNs:        []string{},
 		DirectReadFilter:    nil,
@@ -1617,8 +1620,8 @@ func (this *Options) SetDefaults() {
 	if this.OpLogCollectionName == "" {
 		this.OpLogCollectionName = defaultOpts.OpLogCollectionName
 	}
-	if this.MaxWaitSecs == 0 {
-		this.MaxWaitSecs = defaultOpts.MaxWaitSecs
+	if this.MaxAwaitTime == time.Duration(0) {
+		this.MaxAwaitTime = defaultOpts.MaxAwaitTime
 	}
 }
 
