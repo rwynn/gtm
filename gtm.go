@@ -211,6 +211,11 @@ type CollectionStats struct {
 	AvgObjectSize int32 "avgObjSize"
 }
 
+type CollectionInfo struct {
+	Name string "name"
+	Type string "type"
+}
+
 type CollectionSegment struct {
 	min         interface{}
 	max         interface{}
@@ -1175,6 +1180,27 @@ func DirectReadSegment(ctx *OpCtx, client *mongo.Client, ns string, o *Options, 
 	return
 }
 
+func (info *CollectionInfo) isView() bool {
+	return info.Type == "view"
+}
+
+func GetCollectionInfo(ctx *OpCtx, client *mongo.Client, ns string) (info *CollectionInfo, err error) {
+	info = &CollectionInfo{}
+	n := &N{}
+	if err = n.parse(ns); err != nil {
+		ctx.ErrC <- errors.Wrap(err, "Error reading collection info. Invalid namespace")
+		return
+	}
+	var cursor *mongo.Cursor
+	cursor, err = client.Database(n.database).ListCollections(context.Background(), bson.M{"name": n.collection})
+	if err == nil {
+		if cursor.Next(context.Background()) {
+			err = cursor.Decode(info)
+		}
+	}
+	return
+}
+
 func GetCollectionStats(ctx *OpCtx, client *mongo.Client, ns string) (stats *CollectionStats, err error) {
 	stats = &CollectionStats{}
 	n := &N{}
@@ -1380,13 +1406,23 @@ func DirectReadPaged(ctx *OpCtx, client *mongo.Client, ns string, o *Options) (e
 		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace.")
 		return
 	}
-	var stats *CollectionStats
-	stats, _ = GetCollectionStats(ctx, client, ns)
-	c := client.Database(n.database).Collection(n.collection)
-	var maxSplits int32 = o.DirectReadSplitMax
 	segment := &CollectionSegment{
 		splitKey: "_id",
 	}
+	var cinfo *CollectionInfo
+	var stats *CollectionStats = &CollectionStats{}
+	cinfo, _ = GetCollectionInfo(ctx, client, ns)
+	if cinfo.isView() {
+		// bypass collection stats and splitting for views
+		ctx.allWg.Add(1)
+		ctx.DirectReadWg.Add(1)
+		ctx.directReadConcWg.Add(1)
+		go DirectReadSegment(ctx, client, ns, o, segment, stats)
+		return
+	}
+	stats, _ = GetCollectionStats(ctx, client, ns)
+	c := client.Database(n.database).Collection(n.collection)
+	var maxSplits int32 = o.DirectReadSplitMax
 	if maxSplits <= 0 {
 		ctx.allWg.Add(1)
 		ctx.DirectReadWg.Add(1)
