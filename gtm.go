@@ -1193,8 +1193,9 @@ func GetCollectionInfo(ctx *OpCtx, client *mongo.Client, ns string) (info *Colle
 	}
 	var cursor *mongo.Cursor
 	cursor, err = client.Database(n.database).ListCollections(context.Background(), bson.M{"name": n.collection})
-	if err == nil {
-		if cursor.Next(context.Background()) {
+	if cursor != nil {
+		defer cursor.Close(context.Background())
+		if err == nil && cursor.Next(context.Background()) {
 			err = cursor.Decode(info)
 		}
 	}
