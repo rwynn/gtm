@@ -529,7 +529,7 @@ func (ctx *OpCtxMulti) Stop() {
 }
 
 func resumeFail(code int32) bool {
-	return code == 40576 || code == 40585 || code == 40615 || code == 260
+	return code == 40576 || code == 40585 || code == 40615 || code == 260 || code == 280 || code == 286
 }
 
 func positionLost(ec errchk) bool {
@@ -1092,12 +1092,9 @@ func DirectReadSegment(ctx *OpCtx, client *mongo.Client, ns string, o *Options, 
 		ctx.ErrC <- errors.Wrap(err, "Error starting direct reads. Invalid namespace")
 		return
 	}
-	var batch int32 = 500
-	if stats.AvgObjectSize != 0 {
+	var batch int32 = 0
+	if stats.AvgObjectSize > 0 {
 		batch = (2 * 1024 * 1024) / stats.AvgObjectSize // 2MB divided by avg doc size
-		if batch < 500 {
-			batch = 500
-		}
 	}
 	c := client.Database(n.database).Collection(n.collection)
 	if o.DirectReadBounded {
@@ -1293,7 +1290,6 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 	for task.ctx.Err() == nil {
 		var stream *mongo.ChangeStream
 		opts := options.ChangeStream()
-		opts.SetBatchSize(int32(o.ChannelSize))
 		opts.SetFullDocument(options.UpdateLookup)
 		opts.SetStartAtOperationTime(startAt)
 		opts.SetResumeAfter(resumeAfter)
