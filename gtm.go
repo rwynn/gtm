@@ -529,7 +529,11 @@ func (ctx *OpCtxMulti) Stop() {
 }
 
 func resumeFail(code int32) bool {
-	return code == 40576 || code == 40585 || code == 40615 || code == 260 || code == 280 || code == 286
+	switch code {
+	case 40576, 40585, 40615, 260, 280, 286, 257, 10334:
+		return true
+	}
+	return false
 }
 
 func positionLost(ec errchk) bool {
@@ -538,6 +542,10 @@ func positionLost(ec errchk) bool {
 		if ce, ok := err.(mongo.CommandError); ok {
 			code := ce.Code
 			if code == 136 { // cursor capped position lost
+				return true
+			} else if code == 286 { // change stream history lost
+				return true
+			} else if code == 280 { // change stream fatal error
 				return true
 			}
 		}
