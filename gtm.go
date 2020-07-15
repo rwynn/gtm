@@ -446,7 +446,9 @@ func (ctx *OpCtx) isStopped() bool {
 func (ctx *OpCtx) Since(ts primitive.Timestamp) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
-	ctx.seekC <- ts
+	for i := 0; i < cap(ctx.seekC); i++ {
+		ctx.seekC <- ts
+	}
 }
 
 func (ctx *OpCtx) Pause() {
@@ -454,7 +456,9 @@ func (ctx *OpCtx) Pause() {
 	defer ctx.lock.Unlock()
 	if !ctx.paused {
 		ctx.paused = true
-		ctx.pauseC <- true
+		for i := 0; i < cap(ctx.pauseC); i++ {
+			ctx.pauseC <- true
+		}
 	}
 }
 
@@ -463,7 +467,9 @@ func (ctx *OpCtx) Resume() {
 	defer ctx.lock.Unlock()
 	if ctx.paused {
 		ctx.paused = false
-		ctx.resumeC <- true
+		for i := 0; i < cap(ctx.resumeC); i++ {
+			ctx.resumeC <- true
+		}
 	}
 }
 
