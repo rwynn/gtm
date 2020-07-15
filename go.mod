@@ -1,1 +1,1 @@
-module github.com/rwynn/gtm
+module github.com/rwynn/gtm/v2
