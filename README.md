@@ -15,7 +15,7 @@ The original gtm uses the community mgo driver. To use the community mgo driver 
 
 ### Installation ###
 
-	go get github.com/rwynn/gtm@master
+	go get github.com/rwynn/gtm
 
 ### Setup ###
 
@@ -40,7 +40,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson/bsontype"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
-	"github.com/rwynn/gtm"
+	"github.com/rwynn/gtm/v2"
 	"reflect"
 	"time"
 )
