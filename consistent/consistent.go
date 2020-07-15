@@ -3,8 +3,9 @@ package consistent
 import (
 	"errors"
 	"fmt"
+
 	"github.com/BurntSushi/toml"
-	"github.com/rwynn/gtm"
+	"github.com/rwynn/gtm/v2"
 	"github.com/serialx/hashring"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
