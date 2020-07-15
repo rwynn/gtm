@@ -10,12 +10,12 @@ The original gtm uses the community mgo driver. To use the community mgo driver 
 
 ### Requirements ###
 + [Go](http://golang.org/doc/install)
-+ [mongodb go driver version 1.1.0](https://github.com/mongodb/mongo-go-driver)
++ [mongodb go driver](https://github.com/mongodb/mongo-go-driver)
 + [mongodb](http://www.mongodb.org/)
 
 ### Installation ###
 
-	go get github.com/rwynn/gtm
+	go get github.com/rwynn/gtm/v2
 
 ### Setup ###
 
