@@ -431,7 +431,10 @@ func (n *N) isCollection() bool {
 func (shard *ShardInfo) GetURL() string {
 	hostParts := strings.SplitN(shard.hostname, "/", 2)
 	if len(hostParts) == 2 {
-		return "mongodb://" + hostParts[1] + "?replicaSet=" + hostParts[0]
+		// there might be multiple comma-separated hosts.
+		// for now, we just take the first one and ignore the rest.
+		hosts := strings.Split(hostParts[1], ",")
+		return "mongodb://" + hosts[0] + "?replicaSet=" + hostParts[0]
 	} else {
 		return "mongodb://" + hostParts[0]
 	}
@@ -1711,7 +1714,7 @@ func GetShards(client *mongo.Client) (shardInfos []*ShardInfo) {
 	// use the hostnames to create multiple clients for a call to StartMulti
 	col := client.Database("config").Collection("shards")
 	opts := &options.FindOptions{}
-	cursor, err := col.Find(context.Background(), nil, opts)
+	cursor, err := col.Find(context.Background(), bson.D{}, opts)
 	if err != nil {
 		return
 	}
