@@ -434,7 +434,7 @@ func (shard *ShardInfo) GetURL() string {
 		// there might be multiple comma-separated hosts.
 		// for now, we just take the first one and ignore the rest.
 		hosts := strings.Split(hostParts[1], ",")
-		return "mongodb://" + hosts[0] + "?replicaSet=" + hostParts[0]
+		return "mongodb://" + hosts[0] + "/?replicaSet=" + hostParts[0]
 	} else {
 		return "mongodb://" + hostParts[0]
 	}
