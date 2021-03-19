@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -23,10 +22,6 @@ import (
 var opCodes = [...]string{"c", "i", "u", "d"}
 
 type OrderingGuarantee int
-
-type errchk interface {
-	Err() error
-}
 
 type task struct {
 	doneC  chan bool
@@ -537,24 +532,11 @@ func (ctx *OpCtxMulti) Stop() {
 	}
 }
 
-func resumeFail(code int32) bool {
-	switch code {
-	case 40576, 40585, 40615, 260, 280, 286, 257, 10334:
-		return true
-	}
-	return false
-}
-
-func positionLost(ec errchk) bool {
-	err := ec.Err()
-	if err != nil {
-		if ce, ok := err.(mongo.CommandError); ok {
-			code := ce.Code
-			if code == 136 { // cursor capped position lost
-				return true
-			} else if code == 286 { // change stream history lost
-				return true
-			} else if code == 280 { // change stream fatal error
+func resumeFail(err error) bool {
+	var serverErr mongo.ServerError
+	if errors.As(err, &serverErr) {
+		for _, code := range []int{40576, 40585, 40615, 260, 280, 286, 257, 10334} {
+			if serverErr.HasErrorCode(code) {
 				return true
 			}
 		}
@@ -562,29 +544,30 @@ func positionLost(ec errchk) bool {
 	return false
 }
 
-func cursorTimeout(ec errchk) bool {
-	err := ec.Err()
-	if et, ok := err.(net.Error); ok {
-		return et.Timeout() || et.Temporary()
+func positionLost(err error) bool {
+	var serverErr mongo.ServerError
+	if errors.As(err, &serverErr) {
+		// 136  : cursor capped position lost
+		// 286  : change stream history lost
+		// 280  : change stream fatal error
+		for _, code := range []int{136, 286, 280} {
+			if serverErr.HasErrorCode(code) {
+				return true
+			}
+		}
 	}
 	return false
 }
 
-func invalidCursor(ec errchk) bool {
-	err := ec.Err()
-	if err != nil {
-		if ce, ok := err.(mongo.CommandError); ok {
-			code := ce.Code
-			if code == 43 { // cursor not found
-				return true
-			}
-			if code == 11601 { // cursor interrupted
-				return true
-			}
-			if code == 136 { // cursor capped position lost
-				return true
-			}
-			if code == 237 { // cursor killed
+func invalidCursor(err error) bool {
+	var serverErr mongo.ServerError
+	if errors.As(err, &serverErr) {
+		// 43   : cursor not found
+		// 11601: cursor interrupted
+		// 136  : cursor capped position lost
+		// 237  : cursor killed
+		for _, code := range []int{43, 11601, 136, 237} {
+			if serverErr.HasErrorCode(code) {
 				return true
 			}
 		}
@@ -1090,7 +1073,7 @@ func TailOps(ctx *OpCtx, client *mongo.Client, channels []OpChan, o *Options) er
 				cts = op.Timestamp
 			}
 		}
-		if positionLost(cursor) {
+		if positionLost(cursor.Err()) {
 			cts, _ = FirstOpTimestamp(client, o)
 		}
 		cursor.Close(context.Background())
@@ -1326,8 +1309,7 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 			if stream != nil {
 				stream.Close(context.Background())
 			}
-			ce, isCommandErr := err.(mongo.CommandError)
-			if isCommandErr && resumeFail(ce.Code) {
+			if resumeFail(err) {
 				ctx.ErrC <- errors.Wrap(err, "Error resuming change stream")
 				resumeAfter = nil
 				startAt = nil
@@ -1430,7 +1412,7 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 				break
 			}
 		}
-		if positionLost(stream) {
+		if positionLost(stream.Err()) {
 			resumeAfter = nil
 			startAt = nil
 		}
