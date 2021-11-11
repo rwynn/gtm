@@ -835,7 +835,7 @@ func (this *Op) matchesDirectFilter(o *Options) bool {
 }
 
 func normalizeDocSlice(a []interface{}) []interface{} {
-	var avs []interface{}
+	avs := make([]interface{}, 0, len(a))
 	for _, av := range a {
 		var avc interface{}
 		switch achild := av.(type) {
