@@ -397,7 +397,6 @@ func (n *N) parseForChanges(ns string) {
 		n.database = parts[0]
 		n.collection = parts[1]
 	}
-	return
 }
 
 func (n *N) desc() (dsc string) {
@@ -665,7 +664,7 @@ func (ctx *OpCtxMulti) AddShardListener(
 func ChainOpFilters(filters ...OpFilter) OpFilter {
 	return func(op *Op) bool {
 		for _, filter := range filters {
-			if filter(op) == false {
+			if !filter(op) {
 				return false
 			}
 		}
@@ -1120,12 +1119,10 @@ func DirectReadSegment(ctx *OpCtx, client *mongo.Client, ns string, o *Options, 
 			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline stages")
 			return
 		}
-		if pipeline != nil && len(pipeline) > 0 {
+		if len(pipeline) > 0 {
 			var stages []interface{}
 			stages = append(stages, bson.M{"$match": sel})
-			for _, stage := range pipeline {
-				stages = append(stages, stage)
-			}
+			stages = append(stages, pipeline...)
 			opts := options.Aggregate()
 			if batch != 0 {
 				opts.SetBatchSize(batch)
@@ -1260,6 +1257,7 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 	var tokenMode bool
 	var pipeline []interface{}
 	var startAt *primitive.Timestamp = nil
+	var startAfter interface{} = nil
 	var resumeAfter interface{} = nil
 	if o.Token != nil {
 		tokenMode = true
@@ -1281,7 +1279,7 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 			ctx.ErrC <- errors.Wrap(err, "Error building aggregation pipeline stages")
 			return
 		}
-		if stages != nil && len(stages) > 0 {
+		if len(stages) > 0 {
 			pipeline = stages
 		}
 	}
@@ -1293,6 +1291,7 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 		opts.SetFullDocument(options.UpdateLookup)
 		opts.SetStartAtOperationTime(startAt)
 		opts.SetResumeAfter(resumeAfter)
+		opts.SetStartAfter(startAfter)
 		if o.MaxAwaitTime > time.Duration(0) {
 			opts.SetMaxAwaitTime(o.MaxAwaitTime)
 		}
@@ -1313,6 +1312,7 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 				ctx.ErrC <- errors.Wrap(err, "Error resuming change stream")
 				resumeAfter = nil
 				startAt = nil
+				startAfter = nil
 				continue
 			}
 			ctx.ErrC <- errors.Wrap(err, "Error starting change stream. Will retry")
@@ -1327,6 +1327,7 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 			}
 			resumeAfter = changeDoc.Id
 			startAt = nil
+			startAfter = nil
 			oper := changeDoc.mapOperation()
 			token := OpResumeToken{
 				StreamID:    ns,
@@ -1357,10 +1358,10 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 					ctx.OpC <- op
 				}
 			} else if changeDoc.isInvalidate() {
+				startAfter = changeDoc.Id
 				resumeAfter = nil
 				startAt = nil
 				next = false
-				time.Sleep(time.Duration(5) * time.Second)
 			} else if oper != "" {
 				op := &Op{
 					Id:          changeDoc.docId(),
@@ -1415,6 +1416,7 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 		if positionLost(stream.Err()) {
 			resumeAfter = nil
 			startAt = nil
+			startAfter = nil
 		}
 		stream.Close(context.Background())
 	}
