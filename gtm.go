@@ -549,7 +549,8 @@ func positionLost(err error) bool {
 		// 136  : cursor capped position lost
 		// 286  : change stream history lost
 		// 280  : change stream fatal error
-		for _, code := range []int{136, 286, 280} {
+		// 10334 : bson object too large
+		for _, code := range []int{136, 286, 280, 10334} {
 			if serverErr.HasErrorCode(code) {
 				return true
 			}
@@ -1073,7 +1074,12 @@ func TailOps(ctx *OpCtx, client *mongo.Client, channels []OpChan, o *Options) er
 			}
 		}
 		if positionLost(cursor.Err()) {
-			cts, _ = FirstOpTimestamp(client, o)
+			ctx.ErrC <- errors.Wrap(cursor.Err(), "Position lost in stream")
+			if cts.IsZero() {
+				cts, _ = FirstOpTimestamp(client, o)
+			} else {
+				cts.T++
+			}
 		}
 		cursor.Close(context.Background())
 	}
@@ -1414,6 +1420,7 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 			}
 		}
 		if positionLost(stream.Err()) {
+			ctx.ErrC <- errors.Wrap(stream.Err(), "Position lost in stream")
 			resumeAfter = nil
 			startAt = nil
 			startAfter = nil
