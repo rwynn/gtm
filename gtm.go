@@ -531,6 +531,15 @@ func (ctx *OpCtxMulti) Stop() {
 	}
 }
 
+func changeStreamNotEnabled(err error) bool {
+	var serverErr mongo.ServerError
+	if errors.As(err, &serverErr) {
+		// The $changeStream stage is only supported on replica sets
+		return serverErr.HasErrorCode(40573)
+	}
+	return false
+}
+
 func resumeFail(err error) bool {
 	var serverErr mongo.ServerError
 	if errors.As(err, &serverErr) {
@@ -1313,6 +1322,10 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 		if err != nil {
 			if stream != nil {
 				stream.Close(context.Background())
+			}
+			if changeStreamNotEnabled(err) {
+				ctx.ErrC <- errors.Wrap(err, "Error starting change stream")
+				return nil
 			}
 			if resumeFail(err) {
 				ctx.ErrC <- errors.Wrap(err, "Error resuming change stream")
