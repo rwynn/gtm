@@ -113,6 +113,7 @@ type Op struct {
 	Doc               interface{}            `json:"doc,omitempty"`
 	UpdateDescription map[string]interface{} `json:"updateDescription,omitempty"`
 	ResumeToken       OpResumeToken          `json:"-"`
+	RawFullDoc        interface{}            `json:"-"`
 }
 
 type ReplStatus struct {
@@ -142,6 +143,11 @@ type ChangeDoc struct {
 	Namespace         ChangeDocNs            "ns"
 	Timestamp         primitive.Timestamp    "clusterTime"
 	UpdateDescription map[string]interface{} "updateDescription"
+}
+
+// extract fullDocument as bson.Raw
+type fullDocOnly struct {
+	RawFullDoc bson.Raw "fullDocument"
 }
 
 func (cd *ChangeDoc) docId() interface{} {
@@ -1344,6 +1350,19 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 				ctx.ErrC <- errors.Wrap(err, "Error decoding change doc")
 				break
 			}
+
+			// get raw full document
+			var fullDoc fullDocOnly
+			if err = stream.Decode(&fullDoc); err != nil {
+				ctx.ErrC <- errors.Wrap(err, "Error decoding change doc")
+				break
+			}
+
+			if len(changeDoc.FullDoc) > 0 && len(fullDoc.RawFullDoc) <= 0 {
+				ctx.ErrC <- errors.New("extract raw fullDocument fail")
+				break
+			}
+
 			resumeAfter = changeDoc.Id
 			startAt = nil
 			startAfter = nil
@@ -1390,6 +1409,12 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 					Timestamp:   changeDoc.mapTimestamp(),
 					ResumeToken: token,
 				}
+
+				// output raw full document
+				if len(fullDoc.RawFullDoc) > 0 {
+					op.RawFullDoc = fullDoc.RawFullDoc
+				}
+
 				if op.matchesNsFilter(o) {
 					if changeDoc.hasUpdate() {
 						op.UpdateDescription = changeDoc.UpdateDescription
