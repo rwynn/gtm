@@ -682,20 +682,20 @@ func ChainOpFilters(filters ...OpFilter) OpFilter {
 	}
 }
 
-func (this *Op) IsDrop() bool {
-	if _, drop := this.IsDropDatabase(); drop {
+func (op *Op) IsDrop() bool {
+	if _, drop := op.IsDropDatabase(); drop {
 		return true
 	}
-	if _, drop := this.IsDropCollection(); drop {
+	if _, drop := op.IsDropCollection(); drop {
 		return true
 	}
 	return false
 }
 
-func (this *Op) IsDropCollection() (string, bool) {
-	if this.IsCommand() {
-		if this.Data != nil {
-			if val, ok := this.Data["drop"]; ok {
+func (op *Op) IsDropCollection() (string, bool) {
+	if op.IsCommand() {
+		if op.Data != nil {
+			if val, ok := op.Data["drop"]; ok {
 				return val.(string), true
 			}
 		}
@@ -703,78 +703,78 @@ func (this *Op) IsDropCollection() (string, bool) {
 	return "", false
 }
 
-func (this *Op) IsDropDatabase() (string, bool) {
-	if this.IsCommand() {
-		if this.Data != nil {
-			if _, ok := this.Data["dropDatabase"]; ok {
-				return this.GetDatabase(), true
+func (op *Op) IsDropDatabase() (string, bool) {
+	if op.IsCommand() {
+		if op.Data != nil {
+			if _, ok := op.Data["dropDatabase"]; ok {
+				return op.GetDatabase(), true
 			}
 		}
 	}
 	return "", false
 }
 
-func (this *Op) IsCommand() bool {
-	return this.Operation == "c"
+func (op *Op) IsCommand() bool {
+	return op.Operation == "c"
 }
 
-func (this *Op) IsInsert() bool {
-	return this.Operation == "i"
+func (op *Op) IsInsert() bool {
+	return op.Operation == "i"
 }
 
-func (this *Op) IsUpdate() bool {
-	return this.Operation == "u"
+func (op *Op) IsUpdate() bool {
+	return op.Operation == "u"
 }
 
-func (this *Op) IsDelete() bool {
-	return this.Operation == "d"
+func (op *Op) IsDelete() bool {
+	return op.Operation == "d"
 }
 
-func (this *Op) IsSourceOplog() bool {
-	return this.Source == OplogQuerySource
+func (op *Op) IsSourceOplog() bool {
+	return op.Source == OplogQuerySource
 }
 
-func (this *Op) IsSourceDirect() bool {
-	return this.Source == DirectQuerySource
+func (op *Op) IsSourceDirect() bool {
+	return op.Source == DirectQuerySource
 }
 
-func (this *Op) ParseNamespace() []string {
-	return strings.SplitN(this.Namespace, ".", 2)
+func (op *Op) ParseNamespace() []string {
+	return strings.SplitN(op.Namespace, ".", 2)
 }
 
-func (this *Op) GetDatabase() string {
-	return this.ParseNamespace()[0]
+func (op *Op) GetDatabase() string {
+	return op.ParseNamespace()[0]
 }
 
-func (this *Op) GetCollection() string {
-	if _, drop := this.IsDropDatabase(); drop {
+func (op *Op) GetCollection() string {
+	if _, drop := op.IsDropDatabase(); drop {
 		return ""
-	} else if col, drop := this.IsDropCollection(); drop {
+	} else if col, drop := op.IsDropCollection(); drop {
 		return col
 	} else {
-		return this.ParseNamespace()[1]
+		return op.ParseNamespace()[1]
 	}
 }
 
-func (this *OpBuf) Append(op *Op) {
-	this.Entries = append(this.Entries, op)
+func (buf *OpBuf) Append(op *Op) {
+	buf.Entries = append(buf.Entries, op)
 }
 
-func (this *OpBuf) IsFull() bool {
-	return len(this.Entries) >= this.BufferSize
+func (buf *OpBuf) IsFull() bool {
+	return len(buf.Entries) >= buf.BufferSize
 }
 
-func (this *OpBuf) HasOne() bool {
-	return len(this.Entries) == 1
+func (buf *OpBuf) HasOne() bool {
+	return len(buf.Entries) == 1
 }
 
-func (this *OpBuf) Flush(client *mongo.Client, ctx *OpCtx, o *Options) {
-	if len(this.Entries) == 0 {
+func (buf *OpBuf) Flush(client *mongo.Client, ctx *OpCtx, o *Options) {
+	if len(buf.Entries) == 0 {
 		return
 	}
 	ns := make(map[string][]interface{})
 	byId := make(map[interface{}][]*Op)
-	for _, op := range this.Entries {
+	for _, op := range buf.Entries {
 		if op.IsUpdate() && op.Doc == nil {
 			idKey := fmt.Sprintf("%s.%v", op.Namespace, op.Id)
 			ns[op.Namespace] = append(ns[op.Namespace], op.Id)
@@ -809,38 +809,28 @@ retry:
 			break retry
 		}
 	}
-	for _, op := range this.Entries {
+	for _, op := range buf.Entries {
 		if op.matchesFilter(o) {
 			ctx.OpC <- op
 		}
 	}
-	this.Entries = nil
+	buf.Entries = nil
 }
 
-func UpdateIsReplace(entry map[string]interface{}) bool {
-	if _, ok := entry["$set"]; ok {
-		return false
-	} else if _, ok := entry["$unset"]; ok {
-		return false
-	} else {
-		return true
-	}
+func (op *Op) shouldParse() bool {
+	return op.IsInsert() || op.IsDelete() || op.IsUpdate() || op.IsCommand()
 }
 
-func (this *Op) shouldParse() bool {
-	return this.IsInsert() || this.IsDelete() || this.IsUpdate() || this.IsCommand()
+func (op *Op) matchesNsFilter(o *Options) bool {
+	return o.NamespaceFilter == nil || o.NamespaceFilter(op)
 }
 
-func (this *Op) matchesNsFilter(o *Options) bool {
-	return o.NamespaceFilter == nil || o.NamespaceFilter(this)
+func (op *Op) matchesFilter(o *Options) bool {
+	return o.Filter == nil || o.Filter(op)
 }
 
-func (this *Op) matchesFilter(o *Options) bool {
-	return o.Filter == nil || o.Filter(this)
-}
-
-func (this *Op) matchesDirectFilter(o *Options) bool {
-	return o.DirectReadFilter == nil || o.DirectReadFilter(this)
+func (op *Op) matchesDirectFilter(o *Options) bool {
+	return o.DirectReadFilter == nil || o.DirectReadFilter(op)
 }
 
 func normalizeDocSlice(a []interface{}) []interface{} {
@@ -887,64 +877,61 @@ func normalizeDocMap(m map[string]interface{}) map[string]interface{} {
 	return o
 }
 
-func (this *Op) processData(data interface{}, o *Options) {
+func (op *Op) processData(data interface{}, o *Options) {
 	if data != nil {
-		this.Doc = data
+		op.Doc = data
 		if m, ok := data.(map[string]interface{}); ok {
-			this.Data = normalizeDocMap(m)
-			this.Doc = this.Data
+			op.Data = normalizeDocMap(m)
+			op.Doc = op.Data
 		}
 		if o.Unmarshal != nil {
-			this.processDoc(data, o)
+			op.processDoc(data, o)
 		}
 	}
 }
 
-func (this *Op) processDoc(data interface{}, o *Options) {
+func (op *Op) processDoc(data interface{}, o *Options) {
 	if o.Unmarshal == nil || data == nil {
 		return
 	}
 	b, err := bson.Marshal(data)
 	if err == nil {
-		this.Doc, err = o.Unmarshal(this.Namespace, b)
+		op.Doc, err = o.Unmarshal(op.Namespace, b)
 		if err != nil {
 			o.Log.Printf("Unable to process document: %s", err)
 		}
 	} else {
 		o.Log.Printf("Unable to process document: %s", err)
 	}
-	return
 }
 
-func (this *Op) ParseLogEntry(entry *OpLog, o *Options) (include bool, err error) {
+func (op *Op) ParseLogEntry(entry *OpLog, o *Options) (include bool, err error) {
 	var rawField map[string]interface{}
-	this.Operation = entry.Operation
-	this.Timestamp = entry.Timestamp
-	this.Namespace = entry.Namespace
-	if this.shouldParse() {
-		if this.IsCommand() {
+	op.Operation = entry.Operation
+	op.Timestamp = entry.Timestamp
+	op.Namespace = entry.Namespace
+	if op.shouldParse() {
+		if op.IsCommand() {
 			rawField = entry.Doc
-			this.processData(rawField, o)
+			op.processData(rawField, o)
 		}
-		if this.matchesNsFilter(o) {
-			if this.IsInsert() || this.IsDelete() || this.IsUpdate() {
-				if this.IsUpdate() {
+		if op.matchesNsFilter(o) {
+			if op.IsInsert() || op.IsDelete() || op.IsUpdate() {
+				if op.IsUpdate() {
 					rawField = entry.Update
 				} else {
 					rawField = entry.Doc
 				}
-				this.Id = rawField["_id"]
-				if this.IsInsert() {
-					this.processData(rawField, o)
-				} else if this.IsUpdate() {
+				op.Id = rawField["_id"]
+				if op.IsInsert() {
+					op.processData(rawField, o)
+				} else if op.IsUpdate() && o.UpdateDataAsDelta {
 					rawField = entry.Doc
-					if o.UpdateDataAsDelta || UpdateIsReplace(rawField) {
-						this.processData(rawField, o)
-					}
+					op.processData(rawField, o)
 				}
 				include = true
-			} else if this.IsCommand() {
-				include = this.IsDrop()
+			} else if op.IsCommand() {
+				include = op.IsDrop()
 			}
 		}
 	}
@@ -1007,11 +994,7 @@ func opDataReady(op *Op, o *Options) (ready bool) {
 	if o.UpdateDataAsDelta {
 		ready = true
 	} else if o.Ordering == AnyOrder {
-		if op.IsUpdate() {
-			ready = op.Data != nil || op.Doc != nil
-		} else {
-			ready = true
-		}
+		ready = !op.IsUpdate()
 	}
 	return
 }
@@ -1429,7 +1412,6 @@ func ConsumeChangeStream(ctx *OpCtx, client *mongo.Client, ns string, o *Options
 					break
 				}
 			default:
-				break
 			}
 		}
 		if positionLost(stream.Err()) {
@@ -1586,7 +1568,6 @@ func FetchDocuments(ctx *OpCtx, client *mongo.Client, filter OpFilter, buf *OpBu
 			}
 		}
 	}
-	return nil
 }
 
 func OpFilterForOrdering(ordering OrderingGuarantee, workers []string, worker string) OpFilter {
@@ -1648,7 +1629,7 @@ func DefaultOptions() *Options {
 	}
 }
 
-func defaultUnmarshaller(namespace string, cursor mongo.Cursor) (interface{}, error) {
+func defaultUnmarshaller(_ string, cursor mongo.Cursor) (interface{}, error) {
 	var m map[string]interface{}
 	if err := cursor.Decode(&m); err == nil {
 		return m, nil
@@ -1657,54 +1638,54 @@ func defaultUnmarshaller(namespace string, cursor mongo.Cursor) (interface{}, er
 	}
 }
 
-func (this *Options) SetDefaults() {
+func (opts *Options) SetDefaults() {
 	defaultOpts := DefaultOptions()
-	if this.ChannelSize < 1 {
-		this.ChannelSize = defaultOpts.ChannelSize
+	if opts.ChannelSize < 1 {
+		opts.ChannelSize = defaultOpts.ChannelSize
 	}
-	if this.BufferSize < 1 {
-		this.BufferSize = defaultOpts.BufferSize
+	if opts.BufferSize < 1 {
+		opts.BufferSize = defaultOpts.BufferSize
 	}
-	if this.BufferDuration == 0 {
-		this.BufferDuration = defaultOpts.BufferDuration
+	if opts.BufferDuration == 0 {
+		opts.BufferDuration = defaultOpts.BufferDuration
 	}
-	if this.Ordering == Oplog {
-		this.WorkerCount = 1
+	if opts.Ordering == Oplog {
+		opts.WorkerCount = 1
 	}
-	if this.WorkerCount < 1 {
-		this.WorkerCount = 1
+	if opts.WorkerCount < 1 {
+		opts.WorkerCount = 1
 	}
-	if this.UpdateDataAsDelta {
-		this.Ordering = Oplog
-		this.WorkerCount = 0
+	if opts.UpdateDataAsDelta {
+		opts.Ordering = Oplog
+		opts.WorkerCount = 0
 	}
-	if this.Unmarshal == nil {
-		this.Unmarshal = defaultOpts.Unmarshal
+	if opts.Unmarshal == nil {
+		opts.Unmarshal = defaultOpts.Unmarshal
 	}
-	if this.Log == nil {
-		this.Log = defaultOpts.Log
+	if opts.Log == nil {
+		opts.Log = defaultOpts.Log
 	}
-	if this.DirectReadConcur == 0 {
-		this.DirectReadConcur = defaultOpts.DirectReadConcur
+	if opts.DirectReadConcur == 0 {
+		opts.DirectReadConcur = defaultOpts.DirectReadConcur
 	}
-	if this.DirectReadSplitMax == 0 {
-		this.DirectReadSplitMax = defaultOpts.DirectReadSplitMax
+	if opts.DirectReadSplitMax == 0 {
+		opts.DirectReadSplitMax = defaultOpts.DirectReadSplitMax
 	}
-	if len(this.ChangeStreamNs) == 0 {
-		if this.After == nil {
-			this.After = defaultOpts.After
+	if len(opts.ChangeStreamNs) == 0 {
+		if opts.After == nil {
+			opts.After = defaultOpts.After
 		}
 	} else {
-		this.OpLogDisabled = true
+		opts.OpLogDisabled = true
 	}
-	if this.OpLogDatabaseName == "" {
-		this.OpLogDatabaseName = defaultOpts.OpLogDatabaseName
+	if opts.OpLogDatabaseName == "" {
+		opts.OpLogDatabaseName = defaultOpts.OpLogDatabaseName
 	}
-	if this.OpLogCollectionName == "" {
-		this.OpLogCollectionName = defaultOpts.OpLogCollectionName
+	if opts.OpLogCollectionName == "" {
+		opts.OpLogCollectionName = defaultOpts.OpLogCollectionName
 	}
-	if this.MaxAwaitTime == time.Duration(0) {
-		this.MaxAwaitTime = defaultOpts.MaxAwaitTime
+	if opts.MaxAwaitTime == time.Duration(0) {
+		opts.MaxAwaitTime = defaultOpts.MaxAwaitTime
 	}
 }
 
@@ -1821,7 +1802,7 @@ func Start(client *mongo.Client, o *Options) *OpCtx {
 	var allWg sync.WaitGroup
 
 	streams := len(o.ChangeStreamNs)
-	if o.OpLogDisabled == false {
+	if !o.OpLogDisabled {
 		streams += 1
 	}
 
@@ -1843,7 +1824,7 @@ func Start(client *mongo.Client, o *Options) *OpCtx {
 		log:              o.Log,
 	}
 
-	if o.OpLogDisabled == false {
+	if !o.OpLogDisabled {
 		for i := 1; i <= o.WorkerCount; i++ {
 			workerNames = append(workerNames, strconv.Itoa(i))
 		}
@@ -1872,7 +1853,7 @@ func Start(client *mongo.Client, o *Options) *OpCtx {
 		go ConsumeChangeStream(ctx, client, ns, o)
 	}
 
-	if o.OpLogDisabled == false {
+	if !o.OpLogDisabled {
 		allWg.Add(1)
 		go TailOps(ctx, client, inOps, o)
 	}
